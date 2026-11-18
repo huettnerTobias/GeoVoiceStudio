@@ -1,4 +1,6 @@
 #include "studio_ui.h"
+#include "studio_aerial.h"
+#include "studio_style.h"
 #include "map.h"
 #include <commctrl.h>
 #include <shlobj.h>
@@ -8,9 +10,11 @@
 HINSTANCE studio_instance;
 GvLibrary studio_library;
 
-static HWND window, route_box, table, canvas, title, point_title, map_title, summary, hint, status, empty;
-static HFONT normal_font, title_font, section_font;
-static HBRUSH paper;
+static HWND window, route_box, route_label, table, canvas, title, point_title, map_title, summary, hint, status;
+static HWND empty, empty_title, aerial_info, hot_button;
+static HFONT normal_font, title_font, section_font, action_font;
+static StudioPalette colors;
+static RECT points_card, map_card;
 static int dpi = 96, route_index = -1, point_index = -1;
 static BOOL refreshing, draw_lines = TRUE, draw_names = TRUE;
 
@@ -26,6 +30,7 @@ static GvPoint *point(void) {
 }
 
 static void message(const wchar_t *text) { SetWindowTextW(status, text); }
+static void aerial_status(const wchar_t *text) { SetWindowTextW(aerial_info, text ? text : L""); }
 static HFONT font(int size, int weight) {
     return CreateFontW(-px(size), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
@@ -39,8 +44,37 @@ static HWND control(const wchar_t *type, const wchar_t *text, DWORD style, DWORD
 static HWND label(const wchar_t *text, HFONT f) {
     return control(L"STATIC", text, SS_LEFT | SS_NOPREFIX, 0, 0, f);
 }
+static LRESULT CALLBACK button_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR data) {
+    (void)data;
+    /* Owner-drawn buttons otherwise let IsDialogMessage redirect Enter to IDOK. */
+    if (msg == WM_GETDLGCODE && wp == VK_RETURN)
+        return DefSubclassProc(wnd, msg, wp, lp) | DLGC_WANTMESSAGE;
+    if (msg == WM_KEYDOWN && wp == VK_RETURN) {
+        if (!(lp & (1L << 30)))
+            SendMessageW(wnd, BM_CLICK, 0, 0);
+        return 0;
+    }
+    if (msg == WM_CHAR && wp == L'\r')
+        return 0;
+    if (msg == WM_MOUSEMOVE && hot_button != wnd) {
+        TRACKMOUSEEVENT track = {.cbSize = sizeof track, .dwFlags = TME_LEAVE, .hwndTrack = wnd};
+        if (TrackMouseEvent(&track)) {
+            hot_button = wnd;
+            InvalidateRect(wnd, NULL, FALSE);
+        }
+    } else if (msg == WM_MOUSELEAVE || msg == WM_NCDESTROY) {
+        if (hot_button == wnd)
+            hot_button = NULL;
+        if (msg == WM_NCDESTROY)
+            RemoveWindowSubclass(wnd, button_proc, id);
+        else
+            InvalidateRect(wnd, NULL, FALSE);
+    }
+    return DefSubclassProc(wnd, msg, wp, lp);
+}
 static void button(int id, const wchar_t *text) {
-    control(L"BUTTON", text, WS_TABSTOP | BS_PUSHBUTTON, 0, id, normal_font);
+    HWND button = control(L"BUTTON", text, WS_TABSTOP | BS_OWNERDRAW, 0, id, action_font);
+    SetWindowSubclass(button, button_proc, 1, 0);
 }
 static void place(HWND child, int x, int y, int w, int h) {
     MoveWindow(child, px(x), px(y), px(w), px(h), TRUE);
@@ -51,34 +85,57 @@ static void layout(void) {
     RECT r;
     GetClientRect(window, &r);
     int w = MulDiv(r.right, 96, dpi), h = MulDiv(r.bottom, 96, dpi);
-    int left = (w - 54) * 43 / 100, right_x = left + 36, right = w - right_x - 18;
-    int btn_w = (left - 12) / 3;
-    place(title, 18, 10, 277, 37);
-    place_id(ID_LIBRARY, w - 284, 13, 126, 29);
-    place_id(ID_MAPS, w - 151, 13, 133, 29);
-    place(route_box, 18, 63, w - 470, 300);
-    place_id(ID_ROUTE_NEW, w - 442, 61, 118, 30);
-    place_id(ID_FILE_IMPORT, w - 317, 61, 141, 30);
-    place_id(ID_FILE_EXPORT, w - 169, 61, 151, 30);
-    place(point_title, 18, 113, left, 30);
-    place(summary, 18, 145, left, 28);
-    place(map_title, right_x, 113, right - 178, 30);
-    place_id(ID_FIT, w - 192, 110, 100, 28);
-    place_id(ID_MINUS, w - 86, 110, 31, 28);
-    place_id(ID_PLUS, w - 49, 110, 31, 28);
-    place(hint, right_x, 145, right, 26);
-    place(table, 18, 176, left, h - 314);
-    place(empty, 32, 219, left - 30, 75);
-    place(canvas, right_x, 176, right, h - 226);
-    const int buttons[9] = {ID_POINT_NEW, ID_POINT_EDIT, ID_POINT_DELETE, ID_UP,          ID_DOWN,
-                            ID_NEXT,      ID_PLAY,       ID_STOP,         ID_ROUTE_RENAME};
-    for (int i = 0; i < 9; i++)
-        place_id(buttons[i], 18 + (i % 3) * (btn_w + 6), h - 130 + (i / 3) * 29, btn_w, 25);
-    place(status, 18, h - 32, w - 36, 24);
-    int client = px(left) - GetSystemMetrics(SM_CXVSCROLL) - px(6);
-    ListView_SetColumnWidth(table, 0, px(36));
-    ListView_SetColumnWidth(table, 1, (client - px(36)) * 53 / 100);
-    ListView_SetColumnWidth(table, 2, (client - px(36)) * 47 / 100);
+    int margin = w >= 1050 ? 20 : 12, gap = 12, pad = w >= 1050 ? 16 : 12;
+    int left = min(460, max(315, (w - 2 * margin - gap) * 36 / 100));
+    int map_x = margin + left + gap, right = w - margin - map_x, top = 136, bottom = h - 44;
+    points_card = (RECT){px(margin), px(top), px(margin + left), px(bottom)};
+    map_card = (RECT){px(map_x), px(top), px(w - margin), px(bottom)};
+    int lx = margin + pad, lw = left - 2 * pad, mx = map_x + pad, mw = right - 2 * pad;
+
+    place(title, 65, 15, 264, 35);
+    place_id(ID_FILE_IMPORT, w - 352, 14, 156, 34);
+    place_id(ID_FILE_EXPORT, w - 188, 14, 168, 34);
+    place(route_label, 20, 82, 82, 21);
+    int choice = min(430, w - 530);
+    place(route_box, 105, 77, choice, 310);
+    place_id(ID_ROUTE_NEW, 115 + choice, 75, 96, 33);
+    place_id(ID_ROUTE_RENAME, 217 + choice, 75, 106, 33);
+    place_id(ID_LIBRARY, w - 150, 75, 130, 33);
+
+    place(point_title, lx, top + 14, lw - 145, 29);
+    place_id(ID_POINT_NEW, lx + lw - 142, top + 12, 142, 32);
+    place(summary, lx, top + 48, lw, 20);
+    int table_y = top + 78, table_h = bottom - 91 - table_y;
+    place(table, lx, table_y, lw, table_h);
+    int empty_y = table_y + max(27, (table_h - 54) / 2);
+    place(empty_title, lx + 10, empty_y, lw - 20, 22);
+    place(empty, lx + 10, empty_y + 24, lw - 20, 45);
+    int move_w = max(50, lw / 5), edit_w = (lw - 2 * move_w - 18) / 2;
+    int y = bottom - 80;
+    place_id(ID_POINT_EDIT, lx, y, edit_w, 30);
+    place_id(ID_POINT_DELETE, lx + edit_w + 6, y, edit_w, 30);
+    place_id(ID_UP, lx + lw - 2 * move_w - 6, y, move_w, 30);
+    place_id(ID_DOWN, lx + lw - move_w, y, move_w, 30);
+    y += 36;
+    int listen_w = (lw - 12) * 33 / 100, stop_w = (lw - 12) * 22 / 100;
+    place_id(ID_PLAY, lx, y, listen_w, 30);
+    place_id(ID_STOP, lx + listen_w + 6, y, stop_w, 30);
+    place_id(ID_NEXT, lx + listen_w + stop_w + 12, y, lw - listen_w - stop_w - 12, 30);
+
+    place(map_title, mx, top + 14, mw - 285, 29);
+    place_id(ID_MAPS, mx + mw - 282, top + 12, 100, 32);
+    place_id(ID_FIT, mx + mw - 176, top + 12, 100, 32);
+    place_id(ID_MINUS, mx + mw - 69, top + 12, 32, 32);
+    place_id(ID_PLUS, mx + mw - 32, top + 12, 32, 32);
+    place(hint, mx, top + 48, mw, 22);
+    place(canvas, mx, table_y, mw, bottom - 45 - table_y);
+    place(aerial_info, mx, bottom - 38, mw, 34);
+    place(status, 20, h - 24, w - 40, 21);
+    int client = px(lw) - GetSystemMetrics(SM_CXVSCROLL) - px(2);
+    ListView_SetColumnWidth(table, 0, px(38));
+    ListView_SetColumnWidth(table, 1, (client - px(38)) * 52 / 100);
+    ListView_SetColumnWidth(table, 2, (client - px(38)) * 48 / 100);
+    InvalidateRect(window, NULL, FALSE);
 }
 
 static void render_points(void) {
@@ -118,6 +175,7 @@ static void buttons(void) {
     enable_action(ID_NEXT, r && r->count);
     enable_action(ID_FIT, r && r->count);
     enable_action(ID_PLAY, selected && point()->audio[0]);
+    enable_action(ID_STOP, r && r->count);
 }
 
 static void refresh(BOOL fit) {
@@ -135,6 +193,11 @@ static void refresh(BOOL fit) {
     GvRoute *r = route();
     size_t count = r ? r->count : 0, assigned = 0;
     if (!count)
+        studio_stop();
+    SetWindowTextW(hint, r ? L"Doppelklick setzt einen Punkt. Mausrad zum Zoomen."
+                           : L"Ziehen verschiebt die Karte. Mausrad zum Zoomen.");
+    InvalidateRect(GetDlgItem(window, ID_ROUTE_NEW), NULL, FALSE);
+    if (!count)
         point_index = -1;
     else if (point_index < 0 || (size_t)point_index >= count)
         point_index = 0;
@@ -149,7 +212,7 @@ static void refresh(BOOL fit) {
         ListView_SetItemText(table, (int)i, 1, p->name);
         if (p->audio[0])
             assigned++;
-        ListView_SetItemText(table, (int)i, 2, p->audio[0] ? p->audio : L"—");
+        ListView_SetItemText(table, (int)i, 2, p->audio[0] ? p->audio : L"Keine Ansage");
     }
     SendMessageW(table, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(table, NULL, TRUE);
@@ -158,19 +221,24 @@ static void refresh(BOOL fit) {
                               LVIS_SELECTED | LVIS_FOCUSED);
         ListView_EnsureVisible(table, point_index, FALSE);
     }
-    SetWindowTextW(empty, r ? L"Ersten Punkt über „Hinzufügen“ oder per Doppelklick auf die Karte setzen."
-                            : L"Zum Start eine neue Route anlegen oder ein Routenpaket importieren.");
+    SetWindowTextW(empty_title, r ? L"Noch keine Punkte" : L"Noch keine Route");
+    SetWindowTextW(empty, r ? L"Setze den ersten Punkt per Doppelklick auf die Karte oder über „Punkt hinzufügen“."
+                            : L"Lege eine neue Route an oder importiere ein Routenpaket.");
+    ShowWindow(empty_title, count ? SW_HIDE : SW_SHOW);
     ShowWindow(empty, count ? SW_HIDE : SW_SHOW);
-    if (!count)
+    if (!count) {
+        SetWindowPos(empty_title, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         SetWindowPos(empty, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
     wchar_t detail[100];
-    swprintf(detail, ARRAYSIZE(detail), L"%zu Punkte  ·  %zu mit Ansage", count, assigned);
+    swprintf(detail, ARRAYSIZE(detail), L"%zu %ls  ·  %zu mit Ansage", count, count == 1 ? L"Punkt" : L"Punkte", assigned);
     SetWindowTextW(summary, detail);
     render_points();
     if (fit && count)
         map_fit(canvas);
     buttons();
     refreshing = FALSE;
+    aerial_route(r);
 }
 
 static BOOL save(void) {
@@ -232,6 +300,7 @@ static void edit_point(BOOL create, double latitude, double longitude) {
         draft = *p;
     if (!studio_point(window, &draft, create))
         return;
+    BOOL point_added = FALSE;
     if (create) {
         if (!gv_add_point(r, draft.name, draft.lat, draft.lon, draft.audio)) {
             studio_error(window, gv_error());
@@ -239,8 +308,10 @@ static void edit_point(BOOL create, double latitude, double longitude) {
         }
         if (!save())
             gv_remove_point(r, r->count - 1);
-        else
+        else {
             point_index = (int)r->count - 1;
+            point_added = TRUE;
+        }
     } else {
         GvPoint original = *p;
         *p = draft;
@@ -250,6 +321,8 @@ static void edit_point(BOOL create, double latitude, double longitude) {
     refresh(FALSE);
     if (point())
         map_center(canvas, point()->lat, point()->lon);
+    if (point_added)
+        aerial_point_added(r);
 }
 
 static void picked(double lat, double lon, void *context) {
@@ -292,6 +365,7 @@ static void remove_selected(BOOL entire) {
         memmove(r, r + 1, tail * sizeof(*r));
         studio_library.count--;
         if (save()) {
+            aerial_forget(old.id);
             free(old.points);
             point_index = 0;
         } else {
@@ -356,9 +430,12 @@ static void command(int id, int event) {
     case ID_POINT_DELETE:
         remove_selected(id == ID_ROUTE_DELETE);
         break;
-    case ID_POINT_NEW:
-        edit_point(TRUE, p ? p->lat : 0, p ? p->lon : 0);
+    case ID_POINT_NEW: {
+        double lat, lon;
+        map_get_center(canvas, &lat, &lon);
+        edit_point(TRUE, p ? p->lat : lat, p ? p->lon : lon);
         break;
+    }
     case ID_POINT_EDIT:
         edit_point(FALSE, 0, 0);
         break;
@@ -402,6 +479,11 @@ static void command(int id, int event) {
     case ID_MAPS:
         map_manage(canvas, route());
         break;
+    case ID_AERIAL_SETTINGS:
+    case ID_AERIAL_SHOW:
+    case ID_AERIAL_FOLDER:
+        aerial_command(id, r);
+        break;
     case ID_FILE_IMPORT:
     case ID_FILE_LEGACY:
     case ID_FILE_EXPORT:
@@ -426,8 +508,10 @@ static void command(int id, int event) {
         MessageBoxW(window,
                     L"1. Route anlegen oder eine bestehende Java-Bibliothek über Datei übernehmen.\n\n"
                     L"2. Unter Offlinekarten eine Karte wählen. Punkte per Doppelklick auf die Karte oder "
-                    L"über Hinzufügen anlegen. Die Punktliste bestimmt die Abspielreihenfolge.\n\n"
-                    L"3. Jedem Punkt eine WAV- oder MP3-Ansage zuordnen. Mit Anhören und Weiter testen.\n\n"
+                    L"über Punkt hinzufügen anlegen. Beim ersten gespeicherten Punkt kannst du automatische "
+                    L"Luftbilder aktivieren. Die Einstellung findest du später unter Karte.\n\n"
+                    L"3. Jedem Punkt eine WAV- oder MP3-Ansage zuordnen. Die Punktliste bestimmt die "
+                    L"Abspielreihenfolge. Mit Anhören und Nächster Punkt testen.\n\n"
                     L"4. Das .geovoice-Paket auf USB exportieren und im Java-Player unter Mehr → Wartung "
                     L"importieren. Die Offlinekarte separat mitnehmen.",
                     L"Mit GeoVoice Studio arbeiten", MB_ICONINFORMATION);
@@ -446,62 +530,112 @@ void studio_transfer_result(BOOL imported, const wchar_t *text) {
 
 static BOOL build_window(void) {
     normal_font = font(15, FW_NORMAL);
-    title_font = font(27, FW_SEMIBOLD);
+    action_font = font(14, FW_MEDIUM);
+    title_font = font(25, FW_SEMIBOLD);
     section_font = font(20, FW_SEMIBOLD);
     title = label(L"GeoVoice Studio", title_font);
+    button(ID_FILE_IMPORT, L"Paket importieren");
+    button(ID_FILE_EXPORT, L"Route exportieren");
+    route_label = label(L"Route", action_font);
     route_box =
         control(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 0, ID_ROUTE, normal_font);
-    button(ID_ROUTE_NEW, L"Neue Route…");
-    button(ID_FILE_IMPORT, L"Paket importieren…");
-    button(ID_FILE_EXPORT, L"Route exportieren…");
-    button(ID_LIBRARY, L"Audiobibliothek…");
-    button(ID_MAPS, L"Offlinekarten…");
+    SendMessageW(route_box, CB_SETITEMHEIGHT, (WPARAM)-1, px(28));
+    button(ID_ROUTE_NEW, L"Neue Route");
+    button(ID_ROUTE_RENAME, L"Umbenennen");
+    button(ID_LIBRARY, L"Audiobibliothek");
     point_title = label(L"Routenpunkte", section_font);
+    button(ID_POINT_NEW, L"Punkt hinzufügen");
     summary = label(L"", normal_font);
     map_title = label(L"Karte", section_font);
-    hint = label(L"Doppelklick setzt einen Punkt. Mit dem Mausrad zoomen.", normal_font);
+    hint = label(L"Doppelklick setzt einen Punkt. Mausrad zum Zoomen.", normal_font);
     table = control(WC_LISTVIEWW, L"",
                     LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP | LVS_NOSORTHEADER,
-                    WS_EX_CLIENTEDGE, ID_LIST, normal_font);
+                    0, ID_LIST, normal_font);
     ListView_SetExtendedListViewStyle(table, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
-    const wchar_t *names[] = {L"Nr.", L"Punkt", L"Ansage"};
+    HIMAGELIST row_spacing = ImageList_Create(1, px(29), ILC_COLOR32, 0, 1);
+    if (row_spacing)
+        ListView_SetImageList(table, row_spacing, LVSIL_SMALL);
+    const wchar_t *names[] = {L"Nr.", L"Name", L"Ansage"};
     for (int i = 0; i < 3; i++) {
         LVCOLUMNW col = {.mask = LVCF_TEXT | LVCF_WIDTH, .pszText = (LPWSTR)names[i], .cx = 100};
         ListView_InsertColumn(table, i, &col);
     }
-    empty = label(L"", normal_font);
-    button(ID_POINT_NEW, L"Hinzufügen…");
-    button(ID_POINT_EDIT, L"Bearbeiten…");
-    button(ID_POINT_DELETE, L"Entfernen…");
-    button(ID_UP, L"Nach oben");
-    button(ID_DOWN, L"Nach unten");
-    button(ID_NEXT, L"Weiter");
+    empty_title = control(L"STATIC", L"", SS_CENTER | SS_NOPREFIX, 0, 0, action_font);
+    empty = control(L"STATIC", L"", SS_CENTER | SS_NOPREFIX, 0, 0, normal_font);
+    button(ID_POINT_EDIT, L"Bearbeiten");
+    button(ID_POINT_DELETE, L"Entfernen");
+    button(ID_UP, L"Hoch");
+    button(ID_DOWN, L"Runter");
     button(ID_PLAY, L"Anhören");
     button(ID_STOP, L"Stopp");
-    button(ID_ROUTE_RENAME, L"Routenname…");
+    button(ID_NEXT, L"Nächster Punkt");
+    button(ID_MAPS, L"Offlinekarten");
     button(ID_FIT, L"Ganze Route");
     button(ID_MINUS, L"−");
     button(ID_PLUS, L"+");
     canvas = map_create(window, 150, picked, NULL);
     if (!canvas)
         return FALSE;
+    aerial_info = label(L"", normal_font);
+    aerial_status(L"");
     status = label(L"Bereit", normal_font);
+    ListView_SetBkColor(table, colors.panel);
+    ListView_SetTextColor(table, colors.text);
     layout();
+    aerial_init(window, canvas, studio_library.dir, aerial_status);
     refresh(TRUE);
     return TRUE;
 }
 
 static LRESULT CALLBACK window_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_STUDIO_AUTO:
+        aerial_notification(route());
+        return 0;
     case WM_CREATE:
         window = wnd;
         if (!build_window())
             return -1;
         return 0;
     case WM_SIZE:
-        if (canvas)
+        if (canvas && wp != SIZE_MINIMIZED)
             layout();
         return 0;
+    case WM_SETTINGCHANGE:
+    case WM_THEMECHANGED:
+    case WM_SYSCOLORCHANGE:
+        studio_palette(&colors);
+        if (table) {
+            ListView_SetBkColor(table, colors.panel);
+            ListView_SetTextColor(table, colors.text);
+        }
+        RedrawWindow(wnd, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN);
+        break;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        RECT rect;
+        HDC dc = BeginPaint(wnd, &ps);
+        GetClientRect(wnd, &rect);
+        studio_workspace_paint(dc, rect, points_card, map_card, dpi, &colors);
+        EndPaint(wnd, &ps);
+        return 0;
+    }
+    case WM_PRINTCLIENT: {
+        RECT rect;
+        GetClientRect(wnd, &rect);
+        studio_workspace_paint((HDC)wp, rect, points_card, map_card, dpi, &colors);
+        return 0;
+    }
+    case WM_DRAWITEM: {
+        const DRAWITEMSTRUCT *item = (const DRAWITEMSTRUCT *)lp;
+        if (item->CtlType == ODT_BUTTON) {
+            studio_button_paint(item, dpi, item->hwndItem == hot_button, &colors);
+            return TRUE;
+        }
+        break;
+    }
     case WM_GETMINMAXINFO: {
         MINMAXINFO *info = (MINMAXINFO *)lp;
         info->ptMinTrackSize.x = px(860);
@@ -513,6 +647,16 @@ static LRESULT CALLBACK window_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_NOTIFY: {
         NMHDR *hdr = (NMHDR *)lp;
+        if (hdr->idFrom == ID_LIST && hdr->code == NM_CUSTOMDRAW) {
+            NMLVCUSTOMDRAW *paint = (NMLVCUSTOMDRAW *)lp;
+            if (paint->nmcd.dwDrawStage == CDDS_PREPAINT)
+                return CDRF_NOTIFYITEMDRAW;
+            if (paint->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+                if (!(paint->nmcd.uItemState & CDIS_SELECTED))
+                    paint->clrTextBk = (paint->nmcd.dwItemSpec & 1) ? colors.stripe : colors.panel;
+                return CDRF_DODEFAULT;
+            }
+        }
         if (hdr->idFrom != ID_LIST || refreshing)
             break;
         if (hdr->code == LVN_ITEMCHANGED) {
@@ -540,11 +684,16 @@ static LRESULT CALLBACK window_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)wp;
-        SetBkColor(dc, RGB(250, 251, 252));
-        SetTextColor(dc, (HWND)lp == title ? RGB(19, 87, 82) : RGB(37, 53, 61));
-        return (LRESULT)paper;
+        HWND child = (HWND)lp;
+        COLORREF bg = child == title ? colors.header : colors.panel;
+        BOOL secondary = child == hint || child == summary || child == status || child == empty;
+        SetBkColor(dc, bg);
+        SetTextColor(dc, child == title ? colors.header_text : secondary ? colors.muted : colors.text);
+        SetDCBrushColor(dc, bg);
+        return (LRESULT)GetStockObject(DC_BRUSH);
     }
     case WM_DESTROY:
+        aerial_stop();
         studio_stop();
         PostQuitMessage(0);
         return 0;
@@ -597,12 +746,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR args, int show
     HDC screen = GetDC(NULL);
     dpi = GetDeviceCaps(screen, LOGPIXELSY);
     ReleaseDC(NULL, screen);
-    paper = CreateSolidBrush(RGB(250, 251, 252));
+    studio_palette(&colors);
     WNDCLASSW cls = {.lpfnWndProc = window_proc,
                      .hInstance = instance,
                      .hCursor = LoadCursorW(NULL, IDC_ARROW),
                      .hIcon = LoadIconW(NULL, IDI_APPLICATION),
-                     .hbrBackground = paper,
                      .lpszMenuName = MAKEINTRESOURCEW(ID_FILE_MENU),
                      .lpszClassName = L"GeoVoiceStudioMain"};
     RegisterClassW(&cls);
@@ -628,12 +776,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR args, int show
         }
         result = got < 0 ? 1 : (int)msg.wParam;
     }
+    aerial_destroy();
     gv_free(&studio_library);
     CloseHandle(lock);
     DeleteObject(normal_font);
     DeleteObject(title_font);
     DeleteObject(section_font);
-    DeleteObject(paper);
+    DeleteObject(action_font);
     OleUninitialize();
     return result;
 }

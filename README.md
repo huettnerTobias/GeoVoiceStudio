@@ -6,11 +6,21 @@ Mit GeoVoice Studio bereitest du am PC Offlinekarten, Routen und Ansagen für de
 
 1. Starte die EXE und wähle **Neue Route**. Bei der ersten Bearbeitung richtest du lokal ein Admin-Passwort und einen Route-Code ein. Der Code schaltet die Bearbeitung für die Sitzung frei. Über **Werkzeuge → Bearbeitung sperren** kannst du sie wieder sperren.
 2. Öffne **Offlinekarten**. Du kannst eine vorhandene Mapsforge-Datei oder einen XYZ-Ordner anzeigen, ein Länderpaket auf den PC herunterladen oder einen XYZ-Ausschnitt für den Player erstellen. Für einen XYZ-Download werden die URL eines für Offline-Downloads freigegebenen Anbieters, die Quellenangabe, die Mitte, der Radius und die Zoomstufen benötigt.
-3. Setze per Doppelklick auf die Karte einen Punkt oder gib unter **Hinzufügen** Breiten- und Längengrad ein. Werte mit Dezimalpunkt und Dezimalkomma werden angenommen. Gib dem Punkt einen Namen und weise ihm eine WAV- oder MP3-Datei zu. **Audio importieren** kopiert die Datei in die Studio-Bibliothek.
-4. Die Punktliste bestimmt die Reihenfolge der Ansagen. Mit **Nach oben** und **Nach unten** änderst du die Reihenfolge. **Weiter** zeigt den nächsten Punkt, **Anhören** spielt die zugeordnete Datei ab. Ein Entwurf darf Punkte ohne Ansage enthalten. Für den Export braucht jeder Punkt einen Namen und eine vorhandene Audiodatei.
+3. Setze per Doppelklick auf die Karte einen Punkt oder gib unter **Punkt hinzufügen** Breiten- und Längengrad ein. Werte mit Dezimalpunkt und Dezimalkomma werden angenommen. Gib dem Punkt einen Namen und weise ihm eine WAV- oder MP3-Datei zu. **Audio importieren** kopiert die Datei in die Studio-Bibliothek.
+4. Die Punktliste bestimmt die Reihenfolge der Ansagen. Mit **Hoch** und **Runter** änderst du die Reihenfolge. **Nächster Punkt** zeigt den nächsten Eintrag, **Anhören** spielt die zugeordnete Datei ab. Ein Entwurf darf Punkte ohne Ansage enthalten. Für den Export braucht jeder Punkt einen Namen und eine vorhandene Audiodatei.
 5. Wähle **Route exportieren** und speichere das `.geovoice`-Paket auf dem USB-Stick. Unter **Datei** kannst du auch alle Routen zusammen exportieren. Auf dem Player importierst du das Paket unter **Mehr → Wartung → Inhalte**. Die Karte separat kopieren. Eine `.map` lässt sich am Player importieren. Einen XYZ-Ordner zuerst auf das Gerät kopieren und dort auswählen.
 
 ## Luftbilder für Österreich
+
+### Beim Setzen von Routenpunkten
+
+Nach dem ersten **gespeicherten** Punkt fragt Studio, ob es die Luftbilder der ausgewählten Route automatisch laden soll. Der Dialog verlinkt basemap.at und die Lizenz CC BY 4.0. Wähle **Automatisch laden** oder **Manuell laden**. Studio merkt sich die Entscheidung für dein Windows-Benutzerkonto. Unter **Karte → Automatische Luftbilder…** kannst du sie jederzeit ändern.
+
+Bei aktivierter Automatik kannst du während des Downloads weitere Punkte setzen oder bearbeiten. Der Status steht unter der Karte. Studio ergänzt fehlende Bildkacheln bis Zoom 19 im lokalen Luftbildordner der Route. Über **Karte → Luftbild dieser Route anzeigen** wechselst du von einer anderen Kartenquelle zum Luftbild.
+
+**Karte → Luftbildordner dieser Route öffnen** zeigt den kopierbaren XYZ-Ordner mit seinen Lizenzhinweisen im Explorer. Er enthält auch früher geladene Kacheln, wenn du Punkte später verschiebst oder löschst. Für einen neuen Ausschnitt entlang des aktuellen Routenverlaufs verwende den manuellen Export.
+
+### Luftbilder manuell vorbereiten
 
 1. Wähle eine Route mit mindestens einem Punkt. Unter **Offlinekarten → Luftbild für die Route** zeigt Studio den Namen der ausgewählten Route an.
 2. Für ein detailreiches Luftbild wähle **Luftbild laden …**. Studio lädt die Originalkacheln von basemap.at entlang der Verbindungen zwischen den Routenpunkten. Die höchste Zoomstufe ist einstellbar von 17 bis 20, voreingestellt ist 19. Ein kleinerer Wert spart Downloadzeit und Platz. Die Detailauflösung hängt vom Aufnahmegebiet ab. [Orthofoto von basemap.at](https://basemap.at/orthofoto/) · [Anleitung des Anbieters zur Offline-Nutzung](https://cdn.basemap.at/basemap-downloader-Anleitung.pdf)

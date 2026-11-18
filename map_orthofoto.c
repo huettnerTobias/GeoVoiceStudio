@@ -53,18 +53,21 @@ static BOOL sidecar(const wchar_t *dir, const wchar_t *name, const wchar_t *text
     return ok;
 }
 
-static BOOL write_credits(const wchar_t *stage, BOOL from_mbtiles, const MbtilesResult *result) {
-    wchar_t license[3072], center[82], zoom[12];
-    StringCchPrintfW(center, ARRAYSIZE(center), L"%.8f,%.8f", result->center_lat, result->center_lon);
-    StringCchPrintfW(zoom, ARRAYSIZE(zoom), L"%d", result->max_zoom);
-    if (FAILED(StringCchPrintfW(license, ARRAYSIZE(license),
+BOOL orthofoto_license_text(wchar_t *text, size_t capacity, BOOL from_mbtiles, const wchar_t *source_credit) {
+    return SUCCEEDED(StringCchPrintfW(text, capacity,
             L"Datenquelle: basemap.at\r\n" ORTHOFOTO_PROVIDER L"\r\n"
             L"Produkt: basemap.at Orthofoto Österreich (EPSG:3857)\r\n%ls\r\n"
             L"Lizenz: Creative Commons Namensnennung 4.0 International (CC BY 4.0)\r\n"
             ORTHOFOTO_LICENCE L"\r\nBearbeitung: Kartenausschnitt entlang der Route als XYZ-Kacheln exportiert.\r\n"
             L"%ls%ls", from_mbtiles ? ORTHOFOTO_PRODUCT : L"https://basemap.at/orthofoto/",
-            result->source_attribution[0] ? L"Quellenangabe im Originalpaket: " : L"",
-            result->source_attribution)))
+            *source_credit ? L"Quellenangabe im Originalpaket: " : L"", source_credit));
+}
+
+static BOOL write_credits(const wchar_t *stage, BOOL from_mbtiles, const MbtilesResult *result) {
+    wchar_t license[3072], center[82], zoom[12];
+    StringCchPrintfW(center, ARRAYSIZE(center), L"%.8f,%.8f", result->center_lat, result->center_lon);
+    StringCchPrintfW(zoom, ARRAYSIZE(zoom), L"%d", result->max_zoom);
+    if (!orthofoto_license_text(license, ARRAYSIZE(license), from_mbtiles, result->source_attribution))
         return FALSE;
     return sidecar(stage, L"LICENSE.txt", license) && sidecar(stage, L"attribution.txt", ORTHOFOTO_CREDIT) &&
            sidecar(stage, L"center.txt", center) && sidecar(stage, L"zoom.txt", zoom);

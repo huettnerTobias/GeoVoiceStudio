@@ -23,10 +23,14 @@ add_library(geovoice_raster STATIC map_corridor.c map_image.c mbtiles.c)
 target_include_directories(geovoice_raster PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(geovoice_raster PRIVATE gdiplus gdi32)
 
+add_library(geovoice_maps STATIC map.c map_download.c map_vector.c map_orthofoto.c)
+target_link_libraries(geovoice_maps PUBLIC geovoice_raster PRIVATE comctl32 comdlg32 shell32 shlwapi
+    gdiplus winhttp ole32 advapi32 bcrypt gdi32 user32 uuid)
+
 add_executable(GeoVoiceStudio WIN32
-    main.c studio_dialogs.c studio_access.c studio_transfer.c studio.rc
-    map.c map_vector.c map_download.c map_orthofoto.c map_dialog.rc)
-target_link_libraries(GeoVoiceStudio PRIVATE geovoice_routes geovoice_raster comctl32 comdlg32 shell32 shlwapi winmm
+    main.c studio_dialogs.c studio_access.c studio_transfer.c studio_style.c studio_aerial.c studio_auto.c studio.rc
+    map_dialog.rc)
+target_link_libraries(GeoVoiceStudio PRIVATE geovoice_routes geovoice_maps comctl32 comdlg32 shell32 shlwapi winmm
     gdiplus winhttp ole32 advapi32 bcrypt gdi32 user32 uuid)
 if(MINGW)
     target_link_options(GeoVoiceStudio PRIVATE -municode -static "$<$<CONFIG:Release>:-s>")
@@ -34,6 +38,13 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(auto_worker tests/auto_worker.c studio_auto.c)
+    target_link_libraries(auto_worker PRIVATE bcrypt gdiplus ole32)
+    if(MINGW)
+        target_link_options(auto_worker PRIVATE -static)
+    endif()
+    add_test(NAME auto_worker COMMAND auto_worker)
+
     add_executable(route_roundtrip tests/route_roundtrip.c)
     target_link_libraries(route_roundtrip PRIVATE geovoice_routes shell32)
     if(MINGW)
@@ -53,6 +64,13 @@ if(BUILD_TESTING)
         target_link_options(orthofoto_publish PRIVATE -static)
     endif()
     add_test(NAME orthofoto_publish COMMAND orthofoto_publish)
+
+    add_executable(orthofoto_cache tests/orthofoto_cache.c)
+    target_link_libraries(orthofoto_cache PRIVATE geovoice_maps ole32 shell32)
+    if(MINGW)
+        target_link_options(orthofoto_cache PRIVATE -static)
+    endif()
+    add_test(NAME orthofoto_cache COMMAND orthofoto_cache)
 endif()
 
 install(TARGETS GeoVoiceStudio RUNTIME DESTINATION .)

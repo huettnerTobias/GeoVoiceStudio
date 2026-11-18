@@ -16,12 +16,14 @@
 #define LIMIT_FILE (8ULL << 30)
 #define LIMIT_XYZ (2ULL << 30)
 #define LIMIT_TILE (2ULL << 20)
+#define ORTHO_TILE_TEMPLATE L"https://maps.wien.gv.at/basemap/bmaporthofoto30cm/normal/google3857/{z}/{y}/{x}.jpeg"
 #define MIRROR L"https://ftp-stud.hs-esslingen.de/pub/Mirrors/download.mapsforge.org/maps/v5/europe/"
 typedef enum { INFO_JOB, FILE_JOB, XYZ_JOB, ORTHO_LOCAL_JOB, ORTHO_ONLINE_JOB } Mode;
 typedef struct {
     HWND dialog, canvas;
     HANDLE thread;
     volatile LONG cancel;
+    volatile LONG *background_cancel;
     CRITICAL_SECTION lock;
     wchar_t status[1024], result[512];
     wchar_t url[URL_CAP], target[MAP_PATH], credit[512], key[1536];
@@ -34,6 +36,7 @@ typedef struct {
     HINTERNET session;
     DWORD http_status;
     uint64_t received;
+    uint64_t cache_bytes;
     ULONGLONG last_update;
 } Job;
 static const wchar_t *countries[] = {L"Österreich", L"Deutschland", L"Schweiz",   L"Italien",
@@ -42,7 +45,9 @@ static const wchar_t *countries[] = {L"Österreich", L"Deutschland", L"Schweiz",
 static const wchar_t *slugs[] = {L"austria",        L"germany",  L"switzerland", L"italy",
                                  L"czech-republic", L"slovakia", L"slovenia",    L"hungary",
                                  L"croatia",        L"france",   L"monaco",      L"liechtenstein"};
-static BOOL cancelled(Job *j) { return InterlockedCompareExchange(&j->cancel, 0, 0) != 0; }
+static BOOL cancelled(Job *j) {
+    return InterlockedCompareExchange(j->background_cancel ? j->background_cancel : &j->cancel, 0, 0) != 0;
+}
 static void report(Job *j, const wchar_t *s) {
     EnterCriticalSection(&j->lock);
     StringCchCopyW(j->status, ARRAYSIZE(j->status), s);
@@ -192,8 +197,9 @@ static BOOL download(Job *j, const wchar_t *first, const wchar_t *temp, HANDLE f
             ok = TRUE;
             goto finish;
         }
-        uint64_t reserve = j->mode == FILE_JOB ? 256ULL << 20 : 0;
-        if (expected > limit || (limit == LIMIT_TILE && expected > LIMIT_XYZ - j->received)) {
+        uint64_t reserve = j->mode == FILE_JOB ? 256ULL << 20 : (j->background_cancel ? 32ULL << 20 : 0);
+        uint64_t remaining = LIMIT_XYZ - j->cache_bytes;
+        if (expected > limit || (limit == LIMIT_TILE && expected > remaining - j->received)) {
             error(j, L"Größenlimit für den Download überschritten.");
             goto finish;
         }
@@ -223,7 +229,7 @@ static BOOL download(Job *j, const wchar_t *first, const wchar_t *temp, HANDLE f
                 }
                 break;
             }
-            if (got + n > limit || (limit == LIMIT_TILE && j->received + n > LIMIT_XYZ)) {
+            if (got + n > limit || (limit == LIMIT_TILE && j->received + n > remaining)) {
                 error(j, L"Downloadlimit überschritten.");
                 break;
             }
@@ -493,7 +499,81 @@ static BOOL within_orthophoto_layer(CorridorTile t) {
            t.y + 1 > map_y(49.037872) * n && t.y < map_y(46.358770) * n;
 }
 
-/* The export worker holds the new stage directory throughout this operation. */
+/* Count the dedicated XYZ tree once, on the first cache miss. A fully cached segment needs no scan. */
+static BOOL cache_usage(Job *j, const wchar_t *dir, int depth, int *tile_count) {
+    wchar_t glob[MAP_PATH];
+    if (FAILED(StringCchPrintfW(glob, MAP_PATH, L"%ls\\*", dir)))
+        return error(j, L"Der Pfad zum Luftbildordner ist zu lang.");
+    WIN32_FIND_DATAW item;
+    HANDLE it = FindFirstFileExW(glob, FindExInfoBasic, &item, FindExSearchNameMatch, NULL,
+                                 FIND_FIRST_EX_LARGE_FETCH);
+    if (it == INVALID_HANDLE_VALUE)
+        return GetLastError() == ERROR_FILE_NOT_FOUND || win_error(j, L"Luftbildordner konnte nicht gelesen werden");
+    BOOL ok = TRUE;
+    do {
+        if (cancelled(j)) {
+            ok = error(j, L"Luftbild-Download abgebrochen.");
+            break;
+        }
+        if (item.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+            continue;
+        if (depth < 2 && (item.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            if (item.cFileName[0] < L'0' || item.cFileName[0] > L'9')
+                continue;
+            wchar_t child[MAP_PATH];
+            if (FAILED(StringCchPrintfW(child, MAP_PATH, L"%ls\\%ls", dir, item.cFileName))) {
+                ok = error(j, L"Der Pfad zum Kachelordner ist zu lang.");
+                break;
+            }
+            HANDLE hold = map_hold_directory(child, FALSE);
+            if (hold == INVALID_HANDLE_VALUE) {
+                ok = win_error(j, L"Kachelordner konnte nicht geöffnet werden");
+                break;
+            }
+            ok = cache_usage(j, child, depth + 1, tile_count);
+            CloseHandle(hold);
+        } else if (depth == 2 && !(item.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                   !_wcsicmp(PathFindExtensionW(item.cFileName), L".jpg")) {
+            j->cache_bytes += ((uint64_t)item.nFileSizeHigh << 32) + item.nFileSizeLow;
+            ++*tile_count;
+            if (j->cache_bytes >= LIMIT_XYZ || *tile_count >= 50000)
+                ok = error(j, L"Der Luftbildordner dieser Route hat das Limit von 2 GiB oder 50.000 Kacheln erreicht.");
+        }
+        if (!ok)
+            break;
+    } while (FindNextFileW(it, &item));
+    if (ok && GetLastError() != ERROR_NO_MORE_FILES)
+        ok = win_error(j, L"Luftbildordner konnte nicht vollständig gelesen werden");
+    FindClose(it);
+    return ok;
+}
+
+static BOOL fetch_orthophoto_tile(Job *j, const wchar_t *root, CorridorTile t, const wchar_t *path,
+                                 int *cache_tiles) {
+    if (j->background_cancel && map_valid_tile(path))
+        return TRUE;
+    j->http_status = 0;
+    if (!j->session) {
+        if (j->background_cancel && !cache_usage(j, root, 0, cache_tiles))
+            return FALSE;
+        j->session = WinHttpOpen(L"GeoVoice Studio/1.0 (basemap.at route map)", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                 NULL, NULL, 0);
+        if (!j->session || !(j->background_cancel ? WinHttpSetTimeouts(j->session, 3000, 5000, 5000, 5000)
+                                                 : WinHttpSetTimeouts(j->session, 5000, 10000, 10000, 15000)))
+            return win_error(j, L"Verbindung zu basemap.at konnte nicht vorbereitet werden");
+    }
+    if (j->background_cancel && *cache_tiles >= 50000)
+        return error(j, L"Das Limit von 50.000 Luftbildkacheln pro Route ist erreicht.");
+    wchar_t url[URL_CAP];
+    /* WMTS orders the indices as row/column. XYZ uses column/row. */
+    if (!url_tile(j, url, t.zoom, t.x, t.y) || !transfer(j, url, path, TRUE))
+        return FALSE;
+    ++*cache_tiles;
+    ++j->loaded;
+    return TRUE;
+}
+
+/* The calling worker holds the destination directory throughout this operation. */
 static BOOL download_orthophoto_tiles(Job *j, const wchar_t *stage, const MapPoint *points, size_t count,
                                       MbtilesResult *result) {
     if (j->zmax < 17 || j->zmax > 20) {
@@ -502,7 +582,8 @@ static BOOL download_orthophoto_tiles(Job *j, const wchar_t *stage, const MapPoi
     }
     unsigned levels = (1u << (j->zmax + 1)) - (1u << 12);
     MapCorridorPlan plan = {0};
-    if (!map_corridor_plan(points, count, levels, &j->cancel, &plan, result->error))
+    if (!map_corridor_plan(points, count, levels, j->background_cancel ? j->background_cancel : &j->cancel,
+                           &plan, result->error))
         return FALSE;
     j->total = 0;
     for (size_t i = 0; i < plan.count; ++i)
@@ -513,12 +594,8 @@ static BOOL download_orthophoto_tiles(Job *j, const wchar_t *stage, const MapPoi
         error(j, L"Die Route liegt außerhalb der österreichischen Orthofoto-Abdeckung.");
         goto finish;
     }
-    j->session = WinHttpOpen(L"GeoVoice Studio/1.0 (basemap.at route map)", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                             NULL, NULL, 0);
-    if (!j->session || !WinHttpSetTimeouts(j->session, 5000, 10000, 10000, 15000)) {
-        win_error(j, L"Verbindung zu basemap.at konnte nicht vorbereitet werden");
-        goto finish;
-    }
+    int cache_tiles = 0;
+    StringCchCopyW(j->url, ARRAYSIZE(j->url), ORTHO_TILE_TEMPLATE);
     result->min_zoom = 21;
     result->max_zoom = -1;
     double nearest = HUGE_VAL;
@@ -527,7 +604,7 @@ static BOOL download_orthophoto_tiles(Job *j, const wchar_t *stage, const MapPoi
         CorridorTile t = plan.tiles[i];
         if (!within_orthophoto_layer(t))
             continue;
-        wchar_t level[MAP_PATH], column[MAP_PATH], path[MAP_PATH], url[256];
+        wchar_t level[MAP_PATH], column[MAP_PATH], path[MAP_PATH];
         if (FAILED(StringCchPrintfW(level, MAP_PATH, L"%ls\\%d", stage, t.zoom)) ||
             FAILED(StringCchPrintfW(column, MAP_PATH, L"%ls\\%d", level, t.x)) ||
             FAILED(StringCchPrintfW(path, MAP_PATH, L"%ls\\%d.jpg", column, t.y))) {
@@ -542,11 +619,7 @@ static BOOL download_orthophoto_tiles(Job *j, const wchar_t *stage, const MapPoi
             win_error(j, L"Kachelordner konnte nicht geöffnet werden");
             goto finish;
         }
-        /* WMTS orders the indices as row/column. The exported XYZ path uses column/row. */
-        StringCchPrintfW(url, ARRAYSIZE(url),
-                         L"https://maps.wien.gv.at/basemap/bmaporthofoto30cm/normal/google3857/%d/%d/%d.jpeg",
-                         t.zoom, t.y, t.x);
-        BOOL got_tile = transfer(j, url, path, TRUE);
+        BOOL got_tile = fetch_orthophoto_tile(j, stage, t, path, &cache_tiles);
         CloseHandle(column_dir);
         CloseHandle(zoom_dir);
         ++j->done;
@@ -593,24 +666,90 @@ finish:
     return ok;
 }
 
-static BOOL raster(Job *j) {
+static HANDLE lock_download(Job *j) {
     wchar_t lockpath[MAP_PATH];
-    if (FAILED(StringCchPrintfW(lockpath, MAP_PATH, L"%ls\\.geovoice-download.lock", j->target)))
-        return error(j, L"Zielpfad ist zu lang.");
+    if (FAILED(StringCchPrintfW(lockpath, MAP_PATH, L"%ls\\.geovoice-download.lock", j->target))) {
+        error(j, L"Zielpfad ist zu lang.");
+        return INVALID_HANDLE_VALUE;
+    }
+    HANDLE guard = CreateFileW(lockpath, GENERIC_READ, 0, NULL, OPEN_ALWAYS,
+                               FILE_ATTRIBUTE_HIDDEN | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (guard == INVALID_HANDLE_VALUE)
+        win_error(j, L"Zielordner ist belegt oder schreibgeschützt");
+    return guard;
+}
+
+static BOOL raster(Job *j) {
     HANDLE root = map_hold_directory(j->target, FALSE);
     if (root == INVALID_HANDLE_VALUE)
         return error(j, L"Ein normaler, zugänglicher Zielordner wird benötigt.");
-    HANDLE guard = CreateFileW(lockpath, FILE_READ_ATTRIBUTES, 0, NULL, OPEN_ALWAYS,
-                               FILE_ATTRIBUTE_HIDDEN | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    HANDLE guard = lock_download(j);
     if (guard == INVALID_HANDLE_VALUE) {
         CloseHandle(root);
-        return win_error(j, L"Zielordner ist belegt oder schreibgeschützt");
+        return FALSE;
     }
     BOOL ok = verify_provider(j) && write_metadata(j, L"attribution.txt", j->credit) && raster_tiles(j);
     CloseHandle(guard);
     CloseHandle(root);
     return ok;
 }
+
+static BOOL cache_sidecar(Job *j, const wchar_t *name, const wchar_t *value) {
+    wchar_t current[1024];
+    if (read_metadata(j->target, name, current, ARRAYSIZE(current)) && !wcscmp(current, value))
+        return TRUE;
+    return write_metadata(j, name, value);
+}
+
+static BOOL cache_view(Job *j, const MbtilesResult *result) {
+    wchar_t center[82], zoom[12], tail;
+    int old_zoom;
+    double lat, lon;
+    if (read_metadata(j->target, L"zoom.txt", zoom, ARRAYSIZE(zoom)) &&
+        swscanf(zoom, L"%d %lc", &old_zoom, &tail) == 1 && old_zoom >= result->max_zoom && old_zoom <= 19 &&
+        read_metadata(j->target, L"center.txt", center, ARRAYSIZE(center)) &&
+        swscanf(center, L"%lf,%lf %lc", &lat, &lon, &tail) == 2 &&
+        isfinite(lat) && fabs(lat) <= 90 && isfinite(lon) && fabs(lon) <= 180)
+        return TRUE;
+    StringCchPrintfW(center, ARRAYSIZE(center), L"%.8f,%.8f", result->center_lat, result->center_lon);
+    StringCchPrintfW(zoom, ARRAYSIZE(zoom), L"%d", result->max_zoom);
+    return cache_sidecar(j, L"center.txt", center) && cache_sidecar(j, L"zoom.txt", zoom);
+}
+
+BOOL orthofoto_cache_update(const wchar_t *directory, const MapPoint *points, size_t count,
+                            volatile LONG *cancel, MbtilesResult *result) {
+    *result = (MbtilesResult){0};
+    Job j = {.mode = ORTHO_ONLINE_JOB, .background_cancel = cancel, .zmax = 19};
+    if (!cancel || cancelled(&j) || FAILED(StringCchCopyW(j.target, MAP_PATH, directory))) {
+        StringCchCopyW(result->error, ARRAYSIZE(result->error), L"Luftbildauftrag abgebrochen oder Zielpfad zu lang.");
+        return FALSE;
+    }
+    HANDLE root = map_hold_directory(directory, TRUE);
+    if (root == INVALID_HANDLE_VALUE) {
+        StringCchCopyW(result->error, ARRAYSIZE(result->error), L"Der Luftbildordner konnte nicht geöffnet werden.");
+        return FALSE;
+    }
+    InitializeCriticalSection(&j.lock);
+    HANDLE guard = lock_download(&j);
+    StringCchCopyW(j.url, ARRAYSIZE(j.url), ORTHO_TILE_TEMPLATE);
+    StringCchCopyW(j.credit, ARRAYSIZE(j.credit), ORTHOFOTO_CREDIT);
+    wchar_t license[1024];
+    BOOL ok = guard != INVALID_HANDLE_VALUE && verify_provider(&j) &&
+              orthofoto_license_text(license, ARRAYSIZE(license), FALSE, L"") &&
+              cache_sidecar(&j, L"LICENSE.txt", license) && cache_sidecar(&j, L"attribution.txt", j.credit) &&
+              download_orthophoto_tiles(&j, directory, points, count, result);
+    /* Also keep partially downloaded images usable offline, with a center and native zoom. */
+    if (result->written && !cache_view(&j, result))
+        ok = FALSE;
+    if (!ok && !result->error[0])
+        StringCchCopyW(result->error, ARRAYSIZE(result->error), j.result);
+    if (guard != INVALID_HANDLE_VALUE)
+        CloseHandle(guard);
+    DeleteCriticalSection(&j.lock);
+    CloseHandle(root);
+    return ok;
+}
+
 static void local_ortho_progress(void *context, int checked, int written) {
     Job *j = context;
     ULONGLONG now = GetTickCount64();

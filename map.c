@@ -13,6 +13,7 @@
 #define MAP_REG L"Software\\GeoVoice\\Studio\\Map"
 typedef struct {
     LONG refs;
+    BOOL automatic;
     MapVector *vector;
     wchar_t path[MAP_PATH], credit[512];
     unsigned zoom_levels;
@@ -211,9 +212,9 @@ static void source(Canvas *c, Source *s, double lat, double lon, int z) {
     c->x = map_x(lon);
     c->y = map_y(lat);
     c->zoom = z;
-    ShowWindow(c->credit_link, wcscmp(s->credit, ORTHOFOTO_CREDIT) == 0 ? SW_SHOWNOACTIVATE : SW_HIDE);
+    ShowWindow(c->credit_link, s && !wcscmp(s->credit, ORTHOFOTO_CREDIT) ? SW_SHOWNOACTIVATE : SW_HIDE);
     HKEY key;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, MAP_REG, 0, NULL, 0, KEY_WRITE, NULL, &key, NULL) ==
+    if (s && !s->automatic && RegCreateKeyExW(HKEY_CURRENT_USER, MAP_REG, 0, NULL, 0, KEY_WRITE, NULL, &key, NULL) ==
         ERROR_SUCCESS) {
         RegSetValueExW(key, L"Path", 0, REG_SZ, (BYTE *)s->path,
                        (DWORD)((wcslen(s->path) + 1) * sizeof(wchar_t)));
@@ -245,8 +246,8 @@ BOOL map_use_file(HWND window, const wchar_t *path) {
     source(c, s, lat, lon, z);
     return TRUE;
 }
-BOOL map_use_directory(HWND window, const wchar_t *path, const wchar_t *credit, double lat, double lon,
-                       int z) {
+static BOOL use_directory(HWND window, const wchar_t *path, const wchar_t *credit, double lat, double lon,
+                          int z, BOOL automatic) {
     Canvas *c = canvas(window);
     DWORD attrs = GetFileAttributesW(path);
     if (!c || attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY))
@@ -255,6 +256,7 @@ BOOL map_use_directory(HWND window, const wchar_t *path, const wchar_t *credit, 
     if (!s)
         return FALSE;
     s->refs = 1;
+    s->automatic = automatic;
     if (FAILED(StringCchCopyW(s->path, MAP_PATH, path))) {
         release(s);
         return FALSE;
@@ -274,11 +276,38 @@ BOOL map_use_directory(HWND window, const wchar_t *path, const wchar_t *credit, 
     source(c, s, lat, lon, fit_zoom(s->zoom_levels, (int)fmax(0, fmin(20, z))));
     return TRUE;
 }
+BOOL map_use_directory(HWND window, const wchar_t *path, const wchar_t *credit, double lat, double lon, int z) {
+    return use_directory(window, path, credit, lat, lon, z, FALSE);
+}
+void map_show_auto_directory(HWND window, const wchar_t *path, BOOL explicit_selection,
+                             double latitude, double longitude) {
+    Canvas *c = canvas(window);
+    if (!c)
+        return;
+    BOOL same_path = c->source && !_wcsicmp(c->source->path, path);
+    if (!explicit_selection && c->source && !c->source->automatic && !same_path)
+        return;
+    if (!explicit_selection) {
+        latitude = map_lat(c->y);
+        longitude = map_lon(c->x);
+    }
+    use_directory(window, path, ORTHOFOTO_CREDIT, latitude, longitude,
+                  explicit_selection ? 19 : c->zoom, !same_path || c->source->automatic);
+}
+void map_leave_auto_directory(HWND window) {
+    Canvas *c = canvas(window);
+    if (c && c->source && c->source->automatic)
+        source(c, NULL, map_lat(c->y), map_lon(c->x), c->zoom);
+}
 void map_current(HWND window, wchar_t *path, size_t cap, double *lat, double *lon) {
     Canvas *c = canvas(window);
     if (!c)
         return;
     StringCchCopyW(path, cap, c->source ? c->source->path : L"");
+    map_get_center(window, lat, lon);
+}
+void map_get_center(HWND window, double *lat, double *lon) {
+    Canvas *c = canvas(window);
     *lat = map_lat(c->y);
     *lon = map_lon(c->x);
 }

@@ -28,6 +28,10 @@ BEGIN
     POPUP "&Karte"
     BEGIN
         MENUITEM "&Offlinekarten verwalten…", ID_MAPS
+        MENUITEM "&Automatische Luftbilder…", ID_AERIAL_SETTINGS
+        MENUITEM "Luftbild dieser Route anzeigen", ID_AERIAL_SHOW
+        MENUITEM "Luftbildordner dieser Route öffnen", ID_AERIAL_FOLDER
+        MENUITEM SEPARATOR
         MENUITEM "&Ganze Route anzeigen", ID_FIT
         MENUITEM "Routen&linie anzeigen", ID_LINE, CHECKED
         MENUITEM "Punkt&namen anzeigen", ID_NAMES, CHECKED
