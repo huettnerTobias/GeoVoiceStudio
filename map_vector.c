@@ -22,9 +22,12 @@ typedef struct {
     uint64_t start, size;
 } Band;
 struct MapVector {
-    HANDLE file, mapping;
-    const unsigned char *data;
+    HANDLE file;
+    volatile LONG cancelled;
     uint64_t size;
+    unsigned char index[4096], *block;
+    uint64_t index_start, block_start;
+    size_t index_length, block_length, block_capacity;
     BOOL debug;
     double south, west, north, east;
     Tag *tags, *poi_tags;
@@ -107,27 +110,42 @@ static Tag tag_info(Slice s) {
     return t;
 }
 static int index_at(double f, int z) { return (int)fmax(0., fmin((1 << z) - 1., floor(f * (1 << z)))); }
+/* Use explicit reads so an unavailable USB or network drive is a normal I/O error. */
+static BOOL read_at(MapVector *v, uint64_t offset, unsigned char *out, DWORD count) {
+    LARGE_INTEGER pos = {.QuadPart = (LONGLONG)offset};
+    DWORD got;
+    return offset <= v->size && count <= v->size - offset &&
+           SetFilePointerEx(v->file, pos, NULL, FILE_BEGIN) &&
+           ReadFile(v->file, out, count, &got, NULL) && got == count;
+}
 MapVector *map_vector_open(const wchar_t *path) {
+    unsigned char *header_bytes = NULL;
     MapVector *v = calloc(1, sizeof *v);
     if (!v)
         return NULL;
     v->file =
-        CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+        CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    BY_HANDLE_FILE_INFORMATION info;
     LARGE_INTEGER size;
-    if (v->file == INVALID_HANDLE_VALUE || !GetFileSizeEx(v->file, &size) || size.QuadPart < 80 ||
+    if (v->file == INVALID_HANDLE_VALUE || GetFileType(v->file) != FILE_TYPE_DISK ||
+        !GetFileInformationByHandle(v->file, &info) ||
+        (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) ||
+        !GetFileSizeEx(v->file, &size) || size.QuadPart < 80 ||
         size.QuadPart > 8LL * 1024 * 1024 * 1024)
         goto fail;
     v->size = (uint64_t)size.QuadPart;
-    v->mapping = CreateFileMappingW(v->file, NULL, PAGE_READONLY, 0, 0, NULL);
-    if (!v->mapping || !(v->data = MapViewOfFile(v->mapping, FILE_MAP_READ, 0, 0, 0)))
+    unsigned char prefix[24];
+    if (!read_at(v, 0, prefix, sizeof prefix) || memcmp(prefix, "mapsforge binary OSM", 20))
         goto fail;
-    Reader r = {v->data + 20, v->data + v->size, TRUE};
-    if (memcmp(v->data, "mapsforge binary OSM", 20))
-        goto fail;
+    Reader r = {prefix + 20, prefix + sizeof prefix, TRUE};
     uint64_t header = number(&r, 4);
-    if (header > v->size - 24 || header > 4 * 1024 * 1024)
+    if (!header || header > v->size - 24 || header > 4 * 1024 * 1024)
         goto fail;
-    r.end = r.p + header;
+    header_bytes = malloc((size_t)header);
+    if (!header_bytes || !read_at(v, 24, header_bytes, (DWORD)header))
+        goto fail;
+    r = (Reader){header_bytes, header_bytes + header, TRUE};
     unsigned version = (unsigned)number(&r, 4);
     if (version < 3 || version > 5 || number(&r, 8) != v->size)
         goto fail;
@@ -195,24 +213,28 @@ MapVector *map_vector_open(const wchar_t *path) {
     }
     if (!r.ok)
         goto fail;
+    free(header_bytes);
     return v;
 fail:
+    free(header_bytes);
     map_vector_close(v);
     return NULL;
 }
 void map_vector_close(MapVector *v) {
     if (!v)
         return;
-    if (v->data)
-        UnmapViewOfFile(v->data);
-    if (v->mapping)
-        CloseHandle(v->mapping);
+    free(v->block);
     if (v->file && v->file != INVALID_HANDLE_VALUE)
         CloseHandle(v->file);
     free(v->poi_tags);
     free(v->tags);
     free(v);
 }
+void map_vector_cancel(MapVector *v) {
+    if (v)
+        InterlockedExchange(&v->cancelled, 1);
+}
+static BOOL render_cancelled(MapVector *v) { return InterlockedCompareExchange(&v->cancelled, 0, 0) != 0; }
 void map_vector_home(MapVector *v, double *lat, double *lon, int *z) {
     *lat = v->has_start ? v->start_lat : (v->north + v->south) / 2.;
     *lon = v->has_start ? v->start_lon : (v->west + v->east) / 2.;
@@ -330,6 +352,10 @@ static void way(Reader *r, MapVector *v, Paint *p, double originLat, double orig
             }
             double lat = originLat, lon = originLon, dy = 0., dx = 0.;
             for (unsigned i = 0; i < count; i++) {
+                if ((i & 1023) == 0 && render_cancelled(v)) {
+                    r->ok = FALSE;
+                    break;
+                }
                 double a = variable(r, TRUE) * .000001, o = variable(r, TRUE) * .000001;
                 if (i > 1 && (f & 4)) {
                     a += dy;
@@ -367,9 +393,42 @@ static uint64_t index_value(const unsigned char *p) {
         n = n * 256 + p[i];
     return n;
 }
-static void block(MapVector *v, Band *b, Paint *p, int x, int y, int pass) {
+/* The renderer visits the same block in several paint passes. The index cache
+   includes the following entry so that block lengths need no separate seek. */
+static const unsigned char *index_bytes(MapVector *v, uint64_t offset, unsigned count) {
+    if (offset < v->index_start || offset - v->index_start + count > v->index_length) {
+        size_t length = (size_t)min(sizeof v->index, v->size - offset);
+        v->index_length = 0;
+        if (length < count || !read_at(v, offset, v->index, (DWORD)length))
+            return NULL;
+        v->index_start = offset;
+        v->index_length = length;
+    }
+    return v->index + (size_t)(offset - v->index_start);
+}
+static const unsigned char *block_bytes(MapVector *v, uint64_t offset, size_t count) {
+    if (v->block_length && v->block_start == offset && v->block_length == count)
+        return v->block;
+    v->block_length = 0;
+    if (count > v->block_capacity) {
+        unsigned char *data = realloc(v->block, count);
+        if (!data)
+            return NULL;
+        v->block = data;
+        v->block_capacity = count;
+    }
+    if (!read_at(v, offset, v->block, (DWORD)count))
+        return NULL;
+    v->block_start = offset;
+    v->block_length = count;
+    return v->block;
+}
+static BOOL block(MapVector *v, Band *b, Paint *p, int x, int y, int pass) {
     uint64_t idx = (uint64_t)(y - b->top) * b->width + x - b->left, total = (uint64_t)b->height * b->width;
-    const unsigned char *sub = v->data + b->start, *entry = sub + (v->debug ? 16 : 0) + idx * 5;
+    uint64_t first = v->debug ? 16 : 0;
+    const unsigned char *entry = index_bytes(v, b->start + first + idx * 5, idx + 1 == total ? 5 : 10);
+    if (!entry)
+        return FALSE;
     uint64_t item = index_value(entry), start = item & 0x7fffffffffULL,
              end = idx + 1 == total ? b->size : index_value(entry + 5) & 0x7fffffffffULL;
     double d = (double)(1 << b->base), tile = p->scale / d;
@@ -379,9 +438,15 @@ static void block(MapVector *v, Band *b, Paint *p, int x, int y, int pass) {
         SetDCBrushColor(p->dc, colors[WATER]);
         FillRect(p->dc, &rect, GetStockObject(DC_BRUSH));
     }
-    if (start >= end || end > b->size || end - start > 16 * 1024 * 1024)
-        return;
-    Reader r = {sub + start, sub + end, TRUE};
+    if (start == end)
+        return TRUE;
+    if (start < first + total * 5 || start > end || end > b->size || end - start > 16 * 1024 * 1024)
+        return FALSE;
+    size_t length = (size_t)(end - start);
+    const unsigned char *data = block_bytes(v, b->start + start, length);
+    if (!data)
+        return FALSE;
+    Reader r = {data, data + length, TRUE};
     if (v->debug)
         take(&r, 32);
     uint64_t ways = 0, pois = 0;
@@ -397,9 +462,11 @@ static void block(MapVector *v, Band *b, Paint *p, int x, int y, int pass) {
     double originLat = map_lat(y / d), originLon = 360. * x / d - 180.;
     if (pass == 2) {
         if (!poi_data)
-            return;
+            return FALSE;
         Reader pr = {poi_data, poi_data + offset, TRUE};
         for (uint64_t i = 0; i < pois && pr.ok && p->labels < 30; i++) {
+            if ((i & 255) == 0 && render_cancelled(v))
+                return FALSE;
             if (v->debug)
                 take(&pr, 32);
             double lat = originLat + variable(&pr, TRUE) * 1e-6, lon = originLon + variable(&pr, TRUE) * 1e-6;
@@ -419,11 +486,15 @@ static void block(MapVector *v, Band *b, Paint *p, int x, int y, int pass) {
                 draw_name(p, name, point);
             }
         }
-        return;
+        return pr.ok;
     }
     int state = SaveDC(p->dc);
     IntersectClipRect(p->dc, rect.left, rect.top, rect.right, rect.bottom);
     for (uint64_t i = 0; i < ways && r.ok; i++) {
+        if ((i & 255) == 0 && render_cancelled(v)) {
+            r.ok = FALSE;
+            break;
+        }
         if (v->debug)
             take(&r, 32);
         unsigned n = vu(&r);
@@ -434,8 +505,9 @@ static void block(MapVector *v, Band *b, Paint *p, int x, int y, int pass) {
         way(&wr, v, p, originLat, originLon, pass == 3 ? 2 : pass);
     }
     RestoreDC(p->dc, state);
+    return r.ok;
 }
-void map_vector_tile(MapVector *v, HDC dc, int z, int tx, int ty) {
+BOOL map_vector_tile(MapVector *v, HDC dc, int z, int tx, int ty) {
     Paint p = {.dc = dc, .z = z, .tx = tx, .ty = ty, .scale = ldexp(256., z)};
     Band *b = &v->band[0];
     for (int i = 0; i < v->bands; i++)
@@ -446,18 +518,20 @@ void map_vector_tile(MapVector *v, HDC dc, int z, int tx, int ty) {
     int x2 = (int)fmin(b->left + b->width - 1, ceil((tx + 1) * ratio) - 1),
         y2 = (int)fmin(b->top + b->height - 1, ceil((ty + 1) * ratio) - 1);
     if (x1 > x2 || y1 > y2 || (int64_t)(x2 - x1 + 1) * (y2 - y1 + 1) > 4096)
-        return;
+        return TRUE;
     int state = SaveDC(dc);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, RGB(73, 68, 62));
     SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
     for (int k = 0; k < 10; k++)
         p.pen[k] = CreatePen(PS_SOLID, k == MAJOR ? 3 : (k == ROAD && z >= 15 ? 2 : 1), colors[k]);
-    for (int pass = 0; pass < (z >= 13 ? 4 : 3); pass++)
-        for (int y = y1; y <= y2; y++)
-            for (int x = x1; x <= x2; x++)
-                block(v, b, &p, x, y, pass);
+    BOOL ok = TRUE;
+    for (int pass = 0; pass < (z >= 13 ? 4 : 3) && ok; pass++)
+        for (int y = y1; y <= y2 && ok; y++)
+            for (int x = x1; x <= x2 && ok; x++)
+                ok = !render_cancelled(v) && block(v, b, &p, x, y, pass);
     RestoreDC(dc, state);
     for (int k = 0; k < 10; k++)
         DeleteObject(p.pen[k]);
+    return ok;
 }

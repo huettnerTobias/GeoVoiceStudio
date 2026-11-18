@@ -33,6 +33,7 @@
 #define ID_AUDIO_DLG 203
 #define ID_SECURITY_DLG 204
 #define ID_UNLOCK_DLG 205
+#define ID_FILE_JOB_DLG 206
 #define ID_VALUE 300
 #define ID_LAT 301
 #define ID_LON 302
@@ -54,6 +55,7 @@
 extern HINSTANCE studio_instance;
 extern GvLibrary studio_library;
 void studio_error(HWND owner, const wchar_t *message);
+BOOL studio_run_file_job(HWND owner, const wchar_t *message, void (*run)(void *), void *arg);
 BOOL studio_name(HWND owner, const wchar_t *title, const wchar_t *label, wchar_t *name, size_t capacity);
 BOOL studio_point(HWND owner, GvPoint *draft, BOOL is_new);
 void studio_audio(HWND owner);

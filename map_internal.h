@@ -19,8 +19,9 @@ static inline double map_lon(double x) { return (x - floor(x)) * 360. - 180.; }
 typedef struct MapVector MapVector;
 MapVector *map_vector_open(const wchar_t *path);
 void map_vector_close(MapVector *v);
+void map_vector_cancel(MapVector *v);
 void map_vector_home(MapVector *v, double *lat, double *lon, int *z);
-void map_vector_tile(MapVector *v, HDC dc, int z, int x, int y);
+BOOL map_vector_tile(MapVector *v, HDC dc, int z, int x, int y);
 BOOL map_use_file(HWND canvas, const wchar_t *path);
 BOOL map_use_directory(HWND canvas, const wchar_t *path, const wchar_t *credit, double lat, double lon,
                        int z);

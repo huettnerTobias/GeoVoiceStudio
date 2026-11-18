@@ -1,5 +1,7 @@
 #include "studio_ui.h"
 #include <commdlg.h>
+#include <commctrl.h>
+#include <process.h>
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <mmsystem.h>
@@ -13,6 +15,54 @@ static const wchar_t package_filter[] = L"GeoVoice-Routenpakete (*.geovoice)\0*.
 
 void studio_error(HWND owner, const wchar_t *message) {
     MessageBoxW(owner, message, L"GeoVoice Studio", MB_ICONERROR | MB_OK);
+}
+
+typedef struct {
+    const wchar_t *message;
+    void (*run)(void *);
+    void *arg;
+    HANDLE thread;
+} FileJob;
+
+static unsigned __stdcall run_job(void *arg) {
+    FileJob *job = arg;
+    job->run(job->arg);
+    return 0;
+}
+
+static INT_PTR CALLBACK file_job_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
+    FileJob *job = (FileJob *)GetWindowLongPtrW(wnd, DWLP_USER);
+    if (msg == WM_INITDIALOG) {
+        job = (FileJob *)lp;
+        SetWindowLongPtrW(wnd, DWLP_USER, lp);
+        SetDlgItemTextW(wnd, ID_PROMPT, job->message);
+        SendDlgItemMessageW(wnd, ID_INFO, PBM_SETMARQUEE, TRUE, 30);
+        if (SetTimer(wnd, 1, 50, NULL))
+            job->thread = (HANDLE)_beginthreadex(NULL, 0, run_job, job, 0, NULL);
+        if (!job->thread)
+            EndDialog(wnd, FALSE);
+        return TRUE;
+    }
+    if (msg == WM_TIMER && wp == 1 && job && job->thread &&
+        WaitForSingleObject(job->thread, 0) == WAIT_OBJECT_0) {
+        KillTimer(wnd, 1);
+        EndDialog(wnd, TRUE);
+        return TRUE;
+    }
+    return msg == WM_CLOSE || (msg == WM_COMMAND && LOWORD(wp) == IDCANCEL);
+}
+
+BOOL studio_run_file_job(HWND owner, const wchar_t *message, void (*run)(void *), void *arg) {
+    FileJob job = {.message = message, .run = run, .arg = arg};
+    DialogBoxParamW(studio_instance, MAKEINTRESOURCEW(ID_FILE_JOB_DLG), owner, file_job_proc, (LPARAM)&job);
+    if (!job.thread) {
+        studio_error(owner, L"Der Dateivorgang konnte nicht gestartet werden.");
+        return FALSE;
+    }
+    // Also join if the owning dialog was destroyed while Windows was shutting down.
+    WaitForSingleObject(job.thread, INFINITE);
+    CloseHandle(job.thread);
+    return TRUE;
 }
 
 static void trim(wchar_t *s) {
@@ -159,8 +209,40 @@ static BOOL audio_selection(HWND list, BOOL combo, wchar_t name[256]) {
     return TRUE;
 }
 
+typedef struct {
+    const wchar_t *files;
+    wchar_t last[256], error[1024];
+    int imported;
+} AudioImport;
+
+static void copy_audio(void *arg) {
+    AudioImport *job = arg;
+    const wchar_t *file = job->files + wcslen(job->files) + 1;
+    BOOL multiple = *file != 0;
+    do {
+        wchar_t full[GV_AUDIO_PATH];
+        const wchar_t *source = job->files;
+        if (multiple) {
+            if (wcslen(job->files) + wcslen(file) + 2 > ARRAYSIZE(full)) {
+                wcscpy(job->error, L"Der Dateipfad ist zu lang.");
+                break;
+            }
+            swprintf(full, ARRAYSIZE(full), L"%ls\\%ls", job->files, file);
+            source = full;
+        }
+        wchar_t name[256];
+        if (!gv_import_audio(&studio_library, source, name)) {
+            lstrcpynW(job->error, gv_error(), ARRAYSIZE(job->error));
+            break;
+        }
+        wcscpy(job->last, name);
+        job->imported++;
+        if (multiple) file += wcslen(file) + 1;
+    } while (multiple && *file);
+}
+
 static BOOL import_audio(HWND owner, BOOL multi, wchar_t last[256]) {
-    wchar_t *files = calloc(32768, sizeof(*files));
+    wchar_t *files = calloc(32769, sizeof(*files));
     if (!files) {
         studio_error(owner, L"Nicht genügend Arbeitsspeicher.");
         return FALSE;
@@ -173,32 +255,16 @@ static BOOL import_audio(HWND owner, BOOL multi, wchar_t last[256]) {
                             .lpstrTitle = L"Ansagen in die Audiobibliothek importieren",
                             .Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST |
                                      OFN_NOCHANGEDIR | (multi ? OFN_ALLOWMULTISELECT : 0)};
-    BOOL imported = FALSE;
+    AudioImport job = {.files = files};
     if (GetOpenFileNameW(&picker)) {
-        const wchar_t *file = files + wcslen(files) + 1;
-        if (!*file) {
-            imported = gv_import_audio(&studio_library, files, last);
-            if (!imported)
-                studio_error(owner, gv_error());
-        } else {
-            for (; *file; file += wcslen(file) + 1) {
-                wchar_t path[GV_AUDIO_PATH];
-                if (wcslen(files) + wcslen(file) + 2 > ARRAYSIZE(path)) {
-                    studio_error(owner, L"Der Dateipfad ist zu lang.");
-                    break;
-                }
-                swprintf(path, ARRAYSIZE(path), L"%ls\\%ls", files, file);
-                if (!gv_import_audio(&studio_library, path, last)) {
-                    studio_error(owner, gv_error());
-                    break;
-                }
-                imported = TRUE;
-            }
+        if (studio_run_file_job(owner, L"Ansagen werden in die Bibliothek kopiert und geprüft …", copy_audio, &job)) {
+            if (*job.error) studio_error(owner, job.error);
+            if (job.imported) wcscpy(last, job.last);
         }
     } else if (CommDlgExtendedError())
         studio_error(owner, L"Die Dateiauswahl ist zu groß oder konnte nicht geöffnet werden.");
     free(files);
-    return imported;
+    return job.imported > 0;
 }
 
 typedef struct {

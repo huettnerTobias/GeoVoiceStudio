@@ -1,5 +1,6 @@
 #include "studio_ui.h"
 #include <bcrypt.h>
+#include <objbase.h>
 #include <wchar.h>
 #include <wctype.h>
 
@@ -11,14 +12,15 @@ typedef struct {
     Credential admin, route;
 } Credentials;
 static BOOL unlocked;
+enum { ACCESS_V1 = 1, ACCESS_V2 = 2 };
 
-static BOOL derive(const wchar_t *input, const UCHAR *salt, UCHAR hash[32]) {
+static BOOL derive(const wchar_t *input, const UCHAR *salt, DWORD version, UCHAR hash[32]) {
     BCRYPT_ALG_HANDLE algorithm = NULL;
     NTSTATUS status =
         BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG);
     if (status >= 0) {
         status = BCryptDeriveKeyPBKDF2(algorithm, (PUCHAR)input, (ULONG)(wcslen(input) * sizeof(wchar_t)),
-                                       (PUCHAR)salt, 16, 210000, hash, 32, 0);
+                                       (PUCHAR)salt, 16, version == ACCESS_V1 ? 210000 : 600000, hash, 32, 0);
         BCryptCloseAlgorithmProvider(algorithm, 0);
     }
     return status >= 0;
@@ -28,15 +30,18 @@ static int read_keys(HWND owner, Credentials *keys) {
     wchar_t path[GV_AUDIO_PATH];
     swprintf(path, ARRAYSIZE(path), L"%ls\\access.dat", studio_library.dir);
     HANDLE handle =
-        CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (handle == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND)
         return 0;
     DWORD length = 0;
     BOOL valid = FALSE;
     if (handle != INVALID_HANDLE_VALUE) {
-        valid = GetFileSize(handle, NULL) == sizeof(*keys) &&
+        BY_HANDLE_FILE_INFORMATION info;
+        valid = GetFileType(handle) == FILE_TYPE_DISK && GetFileInformationByHandle(handle, &info) &&
+                !(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) &&
+                info.nFileSizeHigh == 0 && info.nFileSizeLow == sizeof(*keys) &&
                 ReadFile(handle, keys, sizeof(*keys), &length, NULL) && length == sizeof(*keys) &&
-                keys->version == 1;
+                (keys->version == ACCESS_V1 || keys->version == ACCESS_V2);
         CloseHandle(handle);
     }
     if (!valid)
@@ -48,8 +53,12 @@ static int read_keys(HWND owner, Credentials *keys) {
 static BOOL save_keys(const Credentials *keys) {
     wchar_t path[GV_AUDIO_PATH], temp[GV_AUDIO_PATH];
     swprintf(path, ARRAYSIZE(path), L"%ls\\access.dat", studio_library.dir);
-    swprintf(temp, ARRAYSIZE(temp), L"%ls\\access.tmp", studio_library.dir);
-    HANDLE handle = CreateFileW(temp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    GUID id;
+    wchar_t unique[40];
+    if (FAILED(CoCreateGuid(&id)) || !StringFromGUID2(&id, unique, ARRAYSIZE(unique)))
+        return FALSE;
+    swprintf(temp, ARRAYSIZE(temp), L"%ls\\access-%ls.tmp", studio_library.dir, unique);
+    HANDLE handle = CreateFileW(temp, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
     if (handle == INVALID_HANDLE_VALUE)
         return FALSE;
     DWORD count = 0;
@@ -66,6 +75,7 @@ static BOOL save_keys(const Credentials *keys) {
 typedef struct {
     const wchar_t *label;
     const Credential *credential;
+    DWORD version;
 } Verify;
 
 static INT_PTR CALLBACK verify_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -81,7 +91,7 @@ static INT_PTR CALLBACK verify_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         wchar_t value[128];
         UCHAR hash[32];
         GetDlgItemTextW(wnd, ID_VALUE, value, ARRAYSIZE(value));
-        BOOL valid = derive(value, form->credential->salt, hash);
+        BOOL valid = derive(value, form->credential->salt, form->version, hash);
         SecureZeroMemory(value, sizeof(value));
         unsigned mismatch = 0;
         if (valid)
@@ -103,8 +113,8 @@ static INT_PTR CALLBACK verify_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
     return FALSE;
 }
 
-static BOOL verify(HWND owner, const Credential *credential, const wchar_t *label) {
-    Verify form = {label, credential};
+static BOOL verify(HWND owner, const Credential *credential, DWORD version, const wchar_t *label) {
+    Verify form = {label, credential, version};
     return DialogBoxParamW(studio_instance, MAKEINTRESOURCEW(ID_UNLOCK_DLG), owner, verify_proc,
                            (LPARAM)&form) == TRUE;
 }
@@ -119,7 +129,7 @@ static BOOL create_key(HWND wnd, int field, Credential *key) {
     BOOL created =
         has_text &&
         BCryptGenRandom(NULL, key->salt, sizeof(key->salt), BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0 &&
-        derive(value, key->salt, key->hash);
+        derive(value, key->salt, ACCESS_V2, key->hash);
     SecureZeroMemory(value, sizeof(value));
     return created;
 }
@@ -132,7 +142,7 @@ static INT_PTR CALLBACK setup_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
         return TRUE;
     }
     if (msg == WM_COMMAND && LOWORD(wp) == IDOK) {
-        Credentials keys = {.version = 1};
+        Credentials keys = {.version = ACCESS_V2};
         if (!create_key(wnd, ID_ADMIN, &keys.admin) || !create_key(wnd, ID_CODE, &keys.route))
             studio_error(wnd, L"Bitte ein Admin-Passwort und einen Route-Code eingeben.");
         else if (!save_keys(&keys))
@@ -154,7 +164,7 @@ static INT_PTR CALLBACK setup_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
 void studio_security(HWND owner) {
     Credentials keys;
     int result = read_keys(owner, &keys);
-    if (result == 0 || (result == 1 && verify(owner, &keys.admin, L"Bisheriges Admin-Passwort")))
+    if (result == 0 || (result == 1 && verify(owner, &keys.admin, keys.version, L"Bisheriges Admin-Passwort")))
         DialogBoxParamW(studio_instance, MAKEINTRESOURCEW(ID_SECURITY_DLG), owner, setup_proc, 0);
     SecureZeroMemory(&keys, sizeof(keys));
 }
@@ -167,7 +177,7 @@ BOOL studio_unlock(HWND owner) {
     if (result == 0)
         DialogBoxParamW(studio_instance, MAKEINTRESOURCEW(ID_SECURITY_DLG), owner, setup_proc, 0);
     else if (result == 1)
-        unlocked = verify(owner, &keys.route, L"Route-Code für diese Sitzung");
+        unlocked = verify(owner, &keys.route, keys.version, L"Route-Code für diese Sitzung");
     SecureZeroMemory(&keys, sizeof(keys));
     return unlocked;
 }

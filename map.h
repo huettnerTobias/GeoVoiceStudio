@@ -10,6 +10,7 @@ typedef struct {
 typedef void (*MapPick)(double lat, double lon, void *context);
 HWND map_create(HWND parent, int id, MapPick pick, void *context);
 void map_points(HWND canvas, const MapPoint *points, size_t count, int selected);
+void map_select(HWND canvas, int index);
 void map_center(HWND canvas, double lat, double lon);
 void map_fit(HWND canvas);
 void map_zoom(HWND canvas, int delta);

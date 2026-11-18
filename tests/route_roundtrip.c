@@ -40,6 +40,7 @@ static int same_wav(const wchar_t *path) {
 
 int main(void) {
     GvLibrary source = {0}, player = {0};
+    GvImportPlan *prepared = NULL;
     wchar_t temp[MAX_PATH], unique[40], root[MAX_PATH + 1] = {0};
     wchar_t source_dir[MAX_PATH], player_dir[MAX_PATH], input[MAX_PATH], package[MAX_PATH];
     wchar_t audio[256], installed[GV_AUDIO_PATH], route_id[256], point_id[256];
@@ -87,7 +88,11 @@ int main(void) {
     CHECK(gv_export(&source, 0, package));
     CHECK(gv_import(&player, package, 0) == -1);
     CHECK(wcscmp(player.routes[0].name, L"Wien – Donau") == 0);
-    CHECK(gv_import(&player, package, 1) == 1);
+    CHECK(gv_prepare_import(&player, package, &prepared) == -1 && prepared);
+    CHECK(DeleteFileW(package)); /* The USB source may disappear while the prompt is visible. */
+    int applied = gv_finish_import(prepared, 1);
+    prepared = NULL;
+    CHECK(applied == 1);
     gv_free(&player);
     CHECK(gv_open(&player, player_dir));
     CHECK(player.count == 1 && wcscmp(player.routes[0].id, route_id) == 0);
@@ -95,6 +100,7 @@ int main(void) {
     result = 0;
 
 cleanup:
+    gv_finish_import(prepared, 0);
     gv_free(&player);
     gv_free(&source);
     if (own_directory) {

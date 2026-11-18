@@ -20,6 +20,8 @@
 #define MEDIA_MAX (UINT64_C(4) * 1024 * 1024 * 1024)
 #define TOTAL_MAX (2 * MEDIA_MAX)
 #define MEDIA_COUNT 9999
+#define MODEL_MAX (256U * 1024U * 1024U)
+#define ZIP_ALLOCATION_MAX (16U * 1024U * 1024U)
 #define N(a) (sizeof(a) / sizeof((a)[0]))
 
 static INIT_ONCE error_once = INIT_ONCE_STATIC_INIT;
@@ -130,10 +132,15 @@ static int audio_name(const wchar_t *name) {
         if (*p < 32)
             return fail(L"Steuerzeichen im Audionamen.");
     size_t stem = wcscspn(name, L".");
+    while (stem && name[stem - 1] == L' ')
+        stem--;
+    wchar_t suffix = stem == 4 ? name[3] : 0;
+    int device_number =
+        (suffix >= L'1' && suffix <= L'9') || suffix == L'¹' || suffix == L'²' || suffix == L'³';
     if ((stem == 3 && (!_wcsnicmp(name, L"CON", 3) || !_wcsnicmp(name, L"NUL", 3) ||
                        !_wcsnicmp(name, L"PRN", 3) || !_wcsnicmp(name, L"AUX", 3))) ||
-        (stem == 4 && (!_wcsnicmp(name, L"COM", 3) || !_wcsnicmp(name, L"LPT", 3)) && name[3] >= L'1' &&
-         name[3] <= L'9'))
+        (stem == 6 && !_wcsnicmp(name, L"CONIN$", 6)) || (stem == 7 && !_wcsnicmp(name, L"CONOUT$", 7)) ||
+        (device_number && (!_wcsnicmp(name, L"COM", 3) || !_wcsnicmp(name, L"LPT", 3))))
         return fail(L"Reservierter Windows-Dateiname: %ls", name);
     return 1;
 }
@@ -209,12 +216,20 @@ static int unique_ids(const wchar_t **ids, size_t count) {
 static int valid_routes(const GvRoute *routes, size_t count, int portable) {
     if (portable && !count)
         return fail(L"Bitte mindestens eine Route auswählen.");
+    if (count > MODEL_MAX / sizeof(*routes))
+        return fail(L"Die Routenliste ist zu groß.");
+    size_t remaining = MODEL_MAX - count * sizeof(*routes);
     const wchar_t **ids = calloc(count ? count : 1, sizeof(*ids));
     if (!ids)
         return memory_error();
     int ok = 1;
     for (size_t i = 0; i < count && ok; i++) {
         const GvRoute *r = routes + i;
+        if (r->count > remaining / sizeof(*r->points)) {
+            ok = fail(L"Die Routenliste ist zu groß.");
+            break;
+        }
+        remaining -= r->count * sizeof(*r->points);
         ids[i] = r->id;
         if (!text_present(r->name) || !text_present(r->id) || (portable && !r->count)) {
             ok = fail(L"Die Route „%ls“ braucht einen Namen und zum Export mindestens einen Punkt.",
@@ -249,6 +264,9 @@ static int parse_routes(yyjson_val *arr, GvLibrary *lib, int portable) {
     if (!yyjson_is_arr(arr))
         return fail(L"Die Routenliste fehlt.");
     size_t count = yyjson_arr_size(arr);
+    if (count > MODEL_MAX / sizeof(*lib->routes))
+        return fail(L"Die Routenliste ist zu groß.");
+    size_t remaining = MODEL_MAX - count * sizeof(*lib->routes);
     size_t j0, n0;
     yyjson_val *entry;
     yyjson_arr_foreach(arr, j0, n0, entry) if (!yyjson_is_str(yyjson_obj_get(entry, "id"))) return fail(
@@ -266,6 +284,9 @@ static int parse_routes(yyjson_val *arr, GvLibrary *lib, int portable) {
         if (!yyjson_is_arr(points))
             return fail(L"Punktliste fehlt.");
         r->count = yyjson_arr_size(points);
+        if (r->count > remaining / sizeof(*r->points))
+            return fail(L"Die Routenliste ist zu groß.");
+        remaining -= r->count * sizeof(*r->points);
         yyjson_arr_foreach(
             points, j0, n0,
             entry) if (!yyjson_is_str(yyjson_obj_get(entry, "id"))) return fail(L"Punktkennung fehlt.");
@@ -310,7 +331,25 @@ static int write_routes(yyjson_mut_doc *doc, yyjson_mut_val *arr, const GvRoute 
     return 1;
 }
 static FILE *open_input(const wchar_t *path) {
-    return regular(path) ? _wfsopen(path, L"rb", _SH_DENYWR) : NULL;
+    HANDLE handle = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (handle == INVALID_HANDLE_VALUE)
+        return NULL;
+    BY_HANDLE_FILE_INFORMATION info;
+    if (GetFileType(handle) != FILE_TYPE_DISK || !GetFileInformationByHandle(handle, &info) ||
+        (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
+        CloseHandle(handle);
+        return NULL;
+    }
+    int fd = _open_osfhandle((intptr_t)handle, _O_RDONLY | _O_BINARY);
+    if (fd < 0) {
+        CloseHandle(handle);
+        return NULL;
+    }
+    FILE *f = _fdopen(fd, "rb");
+    if (!f)
+        _close(fd);
+    return f;
 }
 static int temporary(const wchar_t *target, wchar_t temp[GV_AUDIO_PATH]) {
     wchar_t id[40];
@@ -321,8 +360,9 @@ static int temporary(const wchar_t *target, wchar_t temp[GV_AUDIO_PATH]) {
     swprintf(temp, GV_AUDIO_PATH, L"%ls.%ls.tmp", target, id);
     return 1;
 }
-static FILE *open_new(const wchar_t *path) {
-    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+static FILE *open_new(const wchar_t *path, HANDLE *retained) {
+    HANDLE h = CreateFileW(path, GENERIC_WRITE | (retained ? DELETE : 0), 0, NULL, CREATE_NEW,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE)
         return NULL;
     int fd = _open_osfhandle((intptr_t)h, _O_WRONLY | _O_BINARY);
@@ -335,6 +375,20 @@ static FILE *open_new(const wchar_t *path) {
     if (!f) {
         _close(fd);
         DeleteFileW(path);
+        return NULL;
+    }
+    if (retained) {
+        /* The stage stays locked across the confirmation dialog. If the process
+           exits, Windows removes it when its last handle closes. */
+        FILE_DISPOSITION_INFO discard = {TRUE};
+        HANDLE process = GetCurrentProcess();
+        if (!SetFileInformationByHandle(h, FileDispositionInfo, &discard, sizeof(discard)) ||
+            !DuplicateHandle(process, h, process, retained, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            fclose(f);
+            DeleteFileW(path);
+            *retained = NULL;
+            return NULL;
+        }
     }
     return f;
 }
@@ -369,7 +423,7 @@ int gv_save(const GvLibrary *lib) {
         free(s);
         return fail(L"Die Bibliothek überschreitet 4 MiB Routendaten.");
     }
-    FILE *f = open_new(temp);
+    FILE *f = open_new(temp, NULL);
     int ok = 0;
     if (f) {
         int written = fwrite(s, 1, n, f) == n;
@@ -483,6 +537,7 @@ typedef struct {
     char sha[65];
     uint64_t size;
     int descriptor, archive_entry, created;
+    HANDLE stage_handle;
 } Media;
 typedef struct {
     Media *files;
@@ -548,44 +603,93 @@ static Media *lookup(MediaList *list, const wchar_t *name) {
     }
     return NULL;
 }
-static int digest(FILE *f, char hex[65], uint64_t *size) {
-    BCRYPT_ALG_HANDLE alg = NULL;
-    BCRYPT_HASH_HANDLE hash = NULL;
-    int ok = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) >= 0 &&
-             BCryptCreateHash(alg, &hash, NULL, 0, NULL, 0, 0) >= 0;
-    unsigned char block[32768], sum[32];
-    uint64_t total = 0;
-    size_t n;
-    while (ok && (n = fread(block, 1, sizeof(block), f)) != 0) {
-        total += n;
-        ok = total <= MEDIA_MAX && BCryptHashData(hash, block, (ULONG)n, 0) >= 0;
+/* Read the size from the same locked handle used for hashing and transfer. */
+static int input_size(FILE *f, uint64_t limit, uint64_t *size) {
+    LARGE_INTEGER length;
+    if (!GetFileSizeEx((HANDLE)_get_osfhandle(_fileno(f)), &length) || length.QuadPart < 0 ||
+        (uint64_t)length.QuadPart > limit)
+        return fail(L"Die Audiodatei ist zu groß oder ihre Größe konnte nicht bestimmt werden.");
+    *size = (uint64_t)length.QuadPart;
+    return 1;
+}
+
+typedef struct {
+    FILE *file;
+    BCRYPT_ALG_HANDLE alg;
+    BCRYPT_HASH_HANDLE hash;
+    uint64_t expected, transferred;
+} AudioStream;
+
+static int start_stream(AudioStream *s) {
+    if (BCryptOpenAlgorithmProvider(&s->alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) < 0)
+        return fail(L"SHA-256 steht nicht zur Verfügung.");
+    if (BCryptCreateHash(s->alg, &s->hash, NULL, 0, NULL, 0, 0) < 0) {
+        BCryptCloseAlgorithmProvider(s->alg, 0);
+        return fail(L"Die Audio-Prüfsumme konnte nicht initialisiert werden.");
     }
-    ok = ok && !ferror(f) && BCryptFinishHash(hash, sum, sizeof(sum), 0) >= 0;
-    if (hash)
-        BCryptDestroyHash(hash);
-    if (alg)
-        BCryptCloseAlgorithmProvider(alg, 0);
+    return 1;
+}
+
+/* Called by miniz on export and by the ordinary file-copy loop on import. */
+static size_t read_hashed(void *opaque, mz_uint64 offset, void *data, size_t capacity) {
+    AudioStream *s = opaque;
+    if (offset != s->transferred || s->transferred >= s->expected)
+        return 0;
+    uint64_t remaining = s->expected - s->transferred;
+    size_t want = remaining < capacity ? (size_t)remaining : capacity;
+    size_t n = fread(data, 1, want, s->file);
+    if (n && BCryptHashData(s->hash, data, (ULONG)n, 0) >= 0) {
+        s->transferred += n;
+        return n;
+    }
+    return 0;
+}
+
+/* Extraction checks the declared size before writing each block. */
+static size_t write_hashed(void *opaque, mz_uint64 offset, const void *data, size_t n) {
+    AudioStream *s = opaque;
+    if (offset != s->transferred || n > s->expected - s->transferred || n > ULONG_MAX ||
+        fwrite(data, 1, n, s->file) != n || BCryptHashData(s->hash, (PUCHAR)data, (ULONG)n, 0) < 0)
+        return 0;
+    s->transferred += n;
+    return n;
+}
+
+static int end_stream(AudioStream *s, char hex[65]) {
+    unsigned char sum[32];
+    int ok = s->transferred == s->expected && !ferror(s->file) &&
+             BCryptFinishHash(s->hash, sum, sizeof(sum), 0) >= 0;
+    BCryptDestroyHash(s->hash);
+    BCryptCloseAlgorithmProvider(s->alg, 0);
     if (!ok)
-        return fail(L"Audiodatei ist unlesbar, größer als 4 GiB oder konnte nicht geprüft werden.");
+        return fail(L"Audiodatei konnte nicht vollständig verarbeitet werden.");
     static const char digits[] = "0123456789abcdef";
     for (size_t i = 0; i < sizeof(sum); i++) {
         hex[i * 2] = digits[sum[i] >> 4];
         hex[i * 2 + 1] = digits[sum[i] & 15];
     }
     hex[64] = 0;
-    *size = total;
     return 1;
 }
-static int hash_path(const wchar_t *path, char hex[65], uint64_t *size) {
-    FILE *f = open_input(path);
-    if (!f)
-        return fail(L"Audiodatei fehlt oder ist gesperrt: %ls", path);
-    int ok = digest(f, hex, size);
-    fclose(f);
-    return ok;
+
+static int copy_and_hash(FILE *src, FILE *out, uint64_t size, char hex[65]) {
+    AudioStream s = {.file = src, .expected = size};
+    if (!start_stream(&s))
+        return 0;
+    unsigned char block[65536];
+    size_t n;
+    int ok = 1;
+    while ((n = read_hashed(&s, s.transferred, block, sizeof(block))) != 0) {
+        if (out && fwrite(block, 1, n, out) != n) {
+            ok = fail(L"Audiodatei konnte nicht vollständig geschrieben werden.");
+            break;
+        }
+    }
+    return end_stream(&s, hex) && ok;
 }
+
 static int add_media_zip(mz_zip_archive *zip, const GvLibrary *lib, Media *media, yyjson_mut_doc *doc,
-                         yyjson_mut_val *descriptors) {
+                         yyjson_mut_val *descriptors, uint64_t remaining) {
     wchar_t path[GV_AUDIO_PATH];
     char entry[256] = "audio/";
     if (!gv_audio_path(lib, media->name, path) || !to_utf8(media->name, entry + 6, sizeof(entry) - 6))
@@ -593,10 +697,16 @@ static int add_media_zip(mz_zip_archive *zip, const GvLibrary *lib, Media *media
     FILE *f = open_input(path);
     if (!f)
         return fail(L"Audiodatei fehlt oder ist gesperrt: %ls", path);
-    int ok = digest(f, media->sha, &media->size);
-    if (ok && (_fseeki64(f, 0, SEEK_SET) ||
-               !mz_zip_writer_add_cfile(zip, entry, f, media->size, NULL, NULL, 0, 0, NULL, 0, NULL, 0)))
-        ok = fail(L"Audiodatei kann nicht in das Paket geschrieben werden: %ls", media->name);
+    AudioStream s = {.file = f};
+    int ok = input_size(f, remaining < MEDIA_MAX ? remaining : MEDIA_MAX, &s.expected) && start_stream(&s);
+    if (ok) {
+        media->size = s.expected;
+        int added = mz_zip_writer_add_read_buf_callback(zip, entry, read_hashed, &s, s.expected, NULL, NULL,
+                                                        0, 0, NULL, 0, NULL, 0);
+        ok = end_stream(&s, media->sha) && added;
+        if (!ok)
+            fail(L"Audiodatei kann nicht in das Paket geschrieben werden: %ls", media->name);
+    }
     fclose(f);
     if (!ok)
         return 0;
@@ -626,7 +736,7 @@ static int export_routes(const GvLibrary *lib, const GvRoute *routes, size_t cou
         memory_error();
     else
         yyjson_mut_doc_set_root(doc, root);
-    FILE *f = ok ? open_new(temp) : NULL;
+    FILE *f = ok ? open_new(temp, NULL) : NULL;
     if (ok && !f)
         ok = fail(L"Exportziel kann nicht geschrieben werden: %ls", target);
     mz_zip_archive zip = {0};
@@ -635,9 +745,8 @@ static int export_routes(const GvLibrary *lib, const GvRoute *routes, size_t cou
         ok = fail(L"ZIP-Datei kann nicht erstellt werden.");
     uint64_t total = 0;
     for (size_t i = 0; ok && i < media.count; i++) {
-        ok = add_media_zip(&zip, lib, media.files + i, doc, audio);
-        if ((total += media.files[i].size) > TOTAL_MAX)
-            ok = fail(L"Paket überschreitet 8 GiB Audio.");
+        ok = add_media_zip(&zip, lib, media.files + i, doc, audio, TOTAL_MAX - total);
+        total += media.files[i].size;
     }
     size_t bytes = 0;
     char *s = ok ? yyjson_mut_write(doc, 0, &bytes) : NULL;
@@ -671,6 +780,12 @@ static int make_stage(const GvLibrary *lib, Media *m) {
     wchar_t staging[GV_AUDIO_PATH];
     return join(staging, lib->dir, L"media") && temporary(staging, m->stage);
 }
+static int staging_space(const GvLibrary *lib, uint64_t bytes) {
+    ULARGE_INTEGER available;
+    return (GetDiskFreeSpaceExW(lib->dir, &available, NULL, NULL) &&
+            available.QuadPart >= bytes + JSON_MAX) ||
+           fail(L"Zu wenig freier Speicher für Audiodateien und Routendaten.");
+}
 static int descriptors(yyjson_val *audio, MediaList *media) {
     if (!yyjson_is_arr(audio) || yyjson_arr_size(audio) != media->count)
         return fail(L"Audioverzeichnis des Pakets ist unvollständig.");
@@ -695,10 +810,22 @@ static int descriptors(yyjson_val *audio, MediaList *media) {
     }
     return 1;
 }
+/* The ZIP library loads its central directory before the application can check
+   the entry count. GeoVoice entries have short names and need no large ZIP metadata. */
+static void *zip_realloc(void *ctx, void *address, size_t n, size_t size) {
+    (void)ctx;
+    return size && n <= ZIP_ALLOCATION_MAX / size ? realloc(address, n * size) : NULL;
+}
+static void *zip_alloc(void *ctx, size_t n, size_t size) { return zip_realloc(ctx, NULL, n, size); }
+static void zip_free(void *ctx, void *address) {
+    (void)ctx;
+    free(address);
+}
+
 static int read_package(const GvLibrary *lib, const wchar_t *path, GvLibrary *incoming, MediaList *media) {
     FILE *f = open_input(path);
-    mz_zip_archive zip = {0};
-    if (!f || !mz_zip_reader_init_cfile(&zip, f, 0, 0)) {
+    mz_zip_archive zip = {.m_pAlloc = zip_alloc, .m_pRealloc = zip_realloc, .m_pFree = zip_free};
+    if (!f || !mz_zip_reader_init_cfile(&zip, f, 0, MZ_ZIP_FLAG_DO_NOT_SORT_CENTRAL_DIRECTORY)) {
         if (f)
             fclose(f);
         return fail(L"Kein lesbares GeoVoice-ZIP-Paket.");
@@ -749,25 +876,37 @@ static int read_package(const GvLibrary *lib, const wchar_t *path, GvLibrary *in
         }
         m->archive_entry = (int)i;
     }
+    if (ok && media->count) {
+        uint64_t bytes = 0;
+        for (size_t i = 0; i < media->count; i++)
+            bytes += media->files[i].size;
+        ok = staging_space(lib, bytes);
+    }
     for (size_t i = 0; ok && i < media->count; i++) {
         Media *m = media->files + i;
         if (!make_stage(lib, m)) {
             ok = 0;
             break;
         }
-        FILE *out = open_new(m->stage);
+        FILE *out = open_new(m->stage, &m->stage_handle);
         if (!out) {
+            m->stage[0] = 0;
             ok = fail(L"Temporäre Audiodatei kann nicht erstellt werden.");
             break;
         }
-        int extracted = mz_zip_reader_extract_to_cfile(&zip, (mz_uint)m->archive_entry, out, 0);
-        if (fclose(out) || !extracted) {
+        AudioStream s = {.file = out, .expected = m->size};
+        char sha[65];
+        int extracted = start_stream(&s);
+        if (extracted) {
+            int read =
+                mz_zip_reader_extract_to_callback(&zip, (mz_uint)m->archive_entry, write_hashed, &s, 0);
+            extracted = end_stream(&s, sha) && read;
+        }
+        if (!flush_close(out) || !extracted) {
             ok = fail(L"Audiodatei im Paket beschädigt: %ls", m->name);
             break;
         }
-        char sha[65];
-        uint64_t size = 0;
-        if (!hash_path(m->stage, sha, &size) || size != m->size || strcmp(sha, m->sha))
+        if (strcmp(sha, m->sha))
             ok = fail(L"Audio-Prüfsumme stimmt nicht: %ls", m->name);
     }
     mz_zip_reader_end(&zip);
@@ -848,15 +987,25 @@ static int java_routes(const wchar_t *dir, const wchar_t *suffix, GvLibrary *imp
     yyjson_doc_free(doc);
     return ok;
 }
-static int copy_stage(const GvLibrary *lib, const wchar_t *src, Media *m) {
-    if (!regular(src))
-        return fail(L"Audiodatei fehlt oder ist nicht lesbar: %ls", src);
-    if (!make_stage(lib, m))
-        return 0;
-    if (!CopyFileW(src, m->stage, TRUE))
-        return fail(L"Audio konnte nicht kopiert werden: %ls", src);
-    SetFileAttributesW(m->stage, FILE_ATTRIBUTE_NORMAL);
-    return hash_path(m->stage, m->sha, &m->size);
+static int copy_stage(const GvLibrary *lib, const wchar_t *src, Media *m, uint64_t remaining) {
+    FILE *in = open_input(src);
+    if (!in)
+        return fail(L"Audiodatei fehlt oder ist gesperrt: %ls", src);
+    int ok = input_size(in, remaining < MEDIA_MAX ? remaining : MEDIA_MAX, &m->size) &&
+             staging_space(lib, m->size) && make_stage(lib, m);
+    if (ok) {
+        FILE *out = open_new(m->stage, &m->stage_handle);
+        if (out) {
+            ok = copy_and_hash(in, out, m->size, m->sha);
+            if (!flush_close(out))
+                ok = fail(L"Audiodatei konnte nicht gespeichert werden: %ls", m->name);
+        } else {
+            m->stage[0] = 0; /* No temporary file owned by us. */
+            ok = fail(L"Temporäre Audiodatei kann nicht erstellt werden.");
+        }
+    }
+    fclose(in);
+    return ok;
 }
 static int read_java(const GvLibrary *lib, const wchar_t *dir, GvLibrary *incoming, MediaList *media) {
     wchar_t path[GV_AUDIO_PATH];
@@ -893,21 +1042,56 @@ static int read_java(const GvLibrary *lib, const wchar_t *dir, GvLibrary *incomi
     }
     for (size_t i = 0; ok && i < media->count; i++) {
         Media *m = media->files + i;
-        ok = join(path, audio, m->name) && copy_stage(lib, path, m);
-        if (ok && (total += m->size) > TOTAL_MAX)
-            ok = fail(L"Bibliothek überschreitet 8 GiB Audio.");
+        ok = join(path, audio, m->name) && copy_stage(lib, path, m, TOTAL_MAX - total);
+        total += m->size;
     }
     if (lock != INVALID_HANDLE_VALUE)
         CloseHandle(lock);
     return ok;
 }
 static int same_digest(const wchar_t *path, const Media *m, int *same) {
+    FILE *f = open_input(path);
     char sha[65];
-    uint64_t n;
-    if (!hash_path(path, sha, &n))
-        return 0;
-    *same = n == m->size && !strcmp(sha, m->sha);
-    return 1;
+    uint64_t size;
+    if (!f)
+        return fail(L"Audiodatei fehlt oder ist gesperrt: %ls", path);
+    int ok = input_size(f, UINT64_MAX, &size);
+    *same = 0;
+    if (ok && size == m->size) {
+        ok = copy_and_hash(f, NULL, size, sha);
+        *same = ok && !strcmp(sha, m->sha);
+    }
+    fclose(f);
+    return ok;
+}
+static BOOL publish_stage(Media *m, const wchar_t *target) {
+    wchar_t path[GV_AUDIO_PATH];
+    DWORD length = GetFullPathNameW(target, N(path), path, NULL);
+    if (!length || length >= N(path))
+        return FALSE;
+    DWORD bytes = length * sizeof(wchar_t);
+    DWORD info_bytes = (DWORD)sizeof(FILE_RENAME_INFO) + bytes;
+    FILE_RENAME_INFO *rename = calloc(1, info_bytes);
+    if (!rename) {
+        SetLastError(ERROR_OUTOFMEMORY);
+        return FALSE;
+    }
+    rename->FileNameLength = bytes;
+    memcpy(rename->FileName, path, bytes);
+    FILE_DISPOSITION_INFO keep = {FALSE};
+    BOOL ok = SetFileInformationByHandle(m->stage_handle, FileDispositionInfo, &keep, sizeof(keep)) &&
+              SetFileInformationByHandle(m->stage_handle, FileRenameInfo, rename, info_bytes);
+    DWORD reason = GetLastError();
+    free(rename);
+    if (ok) {
+        CloseHandle(m->stage_handle);
+        m->stage_handle = NULL;
+    } else {
+        FILE_DISPOSITION_INFO discard = {TRUE};
+        SetFileInformationByHandle(m->stage_handle, FileDispositionInfo, &discard, sizeof(discard));
+        SetLastError(reason);
+    }
+    return ok;
 }
 static int install_media(const GvLibrary *lib, Media *m) {
     const wchar_t *ext = wcsrchr(m->name, L'.');
@@ -922,7 +1106,7 @@ static int install_media(const GvLibrary *lib, Media *m) {
         if (found == INVALID_HANDLE_VALUE) {
             if (GetLastError() != ERROR_FILE_NOT_FOUND)
                 return fail(L"Audioziel ist nicht zugänglich: %ls", target);
-            if (MoveFileExW(m->stage, target, MOVEFILE_WRITE_THROUGH)) {
+            if (publish_stage(m, target)) {
                 wcscpy(m->installed, candidate);
                 *m->stage = 0;
                 m->created = 1;
@@ -961,8 +1145,8 @@ static void cleanup_media(const GvLibrary *lib, MediaList *media, int undo) {
     for (size_t i = 0; i < media->count; i++) {
         Media *m = media->files + i;
         wchar_t path[GV_AUDIO_PATH];
-        if (*m->stage)
-            DeleteFileW(m->stage);
+        if (m->stage_handle)
+            CloseHandle(m->stage_handle);
         if (undo && m->created && gv_audio_path(lib, m->installed, path))
             DeleteFileW(path);
     }
@@ -976,61 +1160,117 @@ int gv_import_audio(const GvLibrary *lib, const wchar_t *src, wchar_t outName[25
             name = p + 1;
     if (!audio_name(name) || !copy_text(m.name, N(m.name), name))
         return 0;
-    int ok = copy_stage(lib, src, &m) && install_media(lib, &m);
-    if (*m.stage)
-        DeleteFileW(m.stage);
+    int ok = copy_stage(lib, src, &m, MEDIA_MAX) && install_media(lib, &m);
+    if (m.stage_handle)
+        CloseHandle(m.stage_handle);
     if (ok)
         wcscpy(outName, m.installed);
     return ok;
 }
-static size_t find_route(const GvLibrary *lib, const wchar_t *id) {
-    for (size_t i = 0; i < lib->count; i++)
-        if (!wcscmp(lib->routes[i].id, id))
-            return i;
-    return lib->count;
+typedef struct {
+    const wchar_t *id;
+    size_t index;
+} RouteSlot;
+
+static int compare_slot(const void *a, const void *b) {
+    return wcscmp(((const RouteSlot *)a)->id, ((const RouteSlot *)b)->id);
 }
-int gv_import(GvLibrary *lib, const wchar_t *source, int replace) {
-    GvLibrary incoming = {0}, merged = {0};
-    MediaList media = {0};
+
+struct GvImportPlan {
+    GvLibrary *target;
+    GvLibrary incoming;
+    MediaList media;
+    size_t *slots, merged_count;
+};
+
+static void free_plan(GvImportPlan *plan, int undo_media) {
+    cleanup_media(plan->target, &plan->media, undo_media);
+    gv_free(&plan->incoming);
+    free(plan->slots);
+    free(plan);
+}
+
+static int map_import_slots(GvImportPlan *plan) {
+    GvLibrary *target = plan->target;
+    size_t count = plan->incoming.count;
+    RouteSlot *index = target->count ? calloc(target->count, sizeof(*index)) : NULL;
+    plan->slots = count ? calloc(count, sizeof(*plan->slots)) : NULL;
+    if ((target->count && !index) || (count && !plan->slots)) {
+        free(index);
+        return memory_error();
+    }
+    for (size_t i = 0; i < target->count; i++)
+        index[i] = (RouteSlot){target->routes[i].id, i};
+    if (target->count > 1)
+        qsort(index, target->count, sizeof(*index), compare_slot);
+    size_t overlaps = 0;
+    plan->merged_count = target->count;
+    for (size_t i = 0; i < count; i++) {
+        RouteSlot key = {.id = plan->incoming.routes[i].id};
+        const RouteSlot *existing =
+            index ? bsearch(&key, index, target->count, sizeof(*index), compare_slot) : NULL;
+        if (existing) {
+            plan->slots[i] = existing->index;
+            overlaps++;
+        } else
+            plan->slots[i] = plan->merged_count++;
+    }
+    free(index);
+    if (overlaps) {
+        fail(L"%zu vorhandene Route(n) werden ersetzt. Fortfahren?", overlaps);
+        return -1;
+    }
+    return 1;
+}
+
+int gv_prepare_import(GvLibrary *lib, const wchar_t *source, GvImportPlan **out) {
+    *out = NULL;
     DWORD attr = GetFileAttributesW(source);
     if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_REPARSE_POINT))
         return fail(L"Die gewählte Paketdatei oder Bibliothek ist nicht verfügbar.");
-    int ok = (attr & FILE_ATTRIBUTE_DIRECTORY) ? read_java(lib, source, &incoming, &media)
-                                               : read_package(lib, source, &incoming, &media);
-    if (ok && !replace) {
-        size_t overlaps = 0;
-        for (size_t i = 0; i < incoming.count; i++)
-            if (find_route(lib, incoming.routes[i].id) < lib->count)
-                overlaps++;
-        if (overlaps) {
-            fail(L"%zu vorhandene Route(n) werden ersetzt. Fortfahren?", overlaps);
-            ok = -1;
-        }
+    GvImportPlan *plan = calloc(1, sizeof(*plan));
+    if (!plan)
+        return memory_error();
+    plan->target = lib;
+    int ok = (attr & FILE_ATTRIBUTE_DIRECTORY) ? read_java(lib, source, &plan->incoming, &plan->media)
+                                               : read_package(lib, source, &plan->incoming, &plan->media);
+    if (ok)
+        ok = map_import_slots(plan);
+    if (ok) /* Includes the result requiring confirmation. */
+        *out = plan;
+    else
+        free_plan(plan, 0);
+    return ok;
+}
+
+int gv_finish_import(GvImportPlan *plan, int install) {
+    if (!plan)
+        return 0;
+    if (!install) {
+        free_plan(plan, 0);
+        return 1;
     }
-    if (ok == 1) {
-        memcpy(merged.dir, lib->dir, sizeof(merged.dir));
-        merged.count = lib->count;
-        size_t cap = merged.count + incoming.count;
-        merged.routes = calloc(cap ? cap : 1, sizeof(*merged.routes));
-        if (!merged.routes)
-            ok = memory_error();
-        else if (merged.count)
-            memcpy(merged.routes, lib->routes, merged.count * sizeof(*merged.routes));
-    }
-    for (size_t i = 0; ok == 1 && i < media.count; i++)
-        ok = install_media(lib, media.files + i);
-    if (ok == 1) {
-        for (size_t i = 0; i < incoming.count; i++) {
-            GvRoute *r = incoming.routes + i;
+    GvLibrary *lib = plan->target;
+    GvLibrary merged = {.count = plan->merged_count};
+    wcscpy(merged.dir, lib->dir);
+    merged.routes = calloc(merged.count ? merged.count : 1, sizeof(*merged.routes));
+    int ok = merged.routes != NULL;
+    if (!ok)
+        memory_error();
+    else if (lib->count)
+        memcpy(merged.routes, lib->routes, lib->count * sizeof(*merged.routes));
+
+    for (size_t i = 0; ok && i < plan->media.count; i++)
+        ok = install_media(lib, plan->media.files + i);
+    if (ok) {
+        for (size_t i = 0; i < plan->incoming.count; i++) {
+            GvRoute *r = plan->incoming.routes + i;
             for (size_t j = 0; j < r->count; j++) {
                 GvPoint *p = r->points + j;
                 if (*p->audio)
-                    wcscpy(p->audio, lookup(&media, p->audio)->installed);
+                    wcscpy(p->audio, lookup(&plan->media, p->audio)->installed);
             }
-            size_t index = find_route(lib, r->id);
-            if (index == lib->count)
-                index = merged.count++;
-            merged.routes[index] = *r;
+            merged.routes[plan->slots[i]] = *r;
         }
         /* The new and old arrays share point buffers until the replacement succeeds. */
         ok = gv_save(&merged);
@@ -1041,14 +1281,23 @@ int gv_import(GvLibrary *lib, const wchar_t *source, int replace) {
             free(lib->routes);
             *lib = merged;
             merged.routes = NULL;
-            for (size_t i = 0; i < incoming.count; i++)
-                incoming.routes[i].points = NULL;
+            for (size_t i = 0; i < plan->incoming.count; i++)
+                plan->incoming.routes[i].points = NULL;
         }
     }
     free(merged.routes);
-    gv_free(&incoming);
-    cleanup_media(lib, &media, ok != 1);
+    free_plan(plan, !ok);
     return ok;
+}
+
+int gv_import(GvLibrary *lib, const wchar_t *source, int replace) {
+    GvImportPlan *plan = NULL;
+    int result = gv_prepare_import(lib, source, &plan);
+    if (result == -1 && !replace) {
+        gv_finish_import(plan, 0);
+        return -1;
+    }
+    return plan && gv_finish_import(plan, 1);
 }
 static int references(const GvLibrary *lib, const wchar_t *name) {
     for (size_t i = 0; i < lib->count; i++)

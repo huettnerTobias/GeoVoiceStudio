@@ -323,7 +323,7 @@ static void choose_point(int index, BOOL center) {
     ListView_SetItemState(table, index, LVIS_FOCUSED | LVIS_SELECTED, LVIS_FOCUSED | LVIS_SELECTED);
     ListView_EnsureVisible(table, index, FALSE);
     refreshing = FALSE;
-    render_points();
+    map_select(canvas, index);
     buttons();
     if (center)
         map_center(canvas, r->points[index].lat, r->points[index].lon);
@@ -520,6 +520,13 @@ static LRESULT CALLBACK window_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
             if ((row->uChanged & LVIF_STATE) && (row->uNewState & LVIS_SELECTED) &&
                 !(row->uOldState & LVIS_SELECTED))
                 choose_point(row->iItem, TRUE);
+            else if ((row->uChanged & LVIF_STATE) && (row->uOldState & LVIS_SELECTED) &&
+                     !(row->uNewState & LVIS_SELECTED) && row->iItem == point_index &&
+                     ListView_GetNextItem(table, -1, LVNI_SELECTED) < 0) {
+                point_index = -1;
+                map_select(canvas, -1);
+                buttons();
+            }
         } else if (hdr->code == NM_DBLCLK && ((NMITEMACTIVATE *)lp)->iItem >= 0)
             command(ID_POINT_EDIT, 0);
         else if (hdr->code == LVN_KEYDOWN) {

@@ -105,7 +105,7 @@ static void progress(Job *j, uint64_t bytes, uint64_t expected) {
         StringCchPrintfW(line, ARRAYSIZE(line), L"Kartenpaket · %.1f MiB übertragen", bytes / 1048576.);
     report(j, line);
 }
-static BOOL download(Job *j, const wchar_t *first, const wchar_t *temp, uint64_t limit, BOOL head,
+static BOOL download(Job *j, const wchar_t *first, const wchar_t *temp, HANDLE file, uint64_t limit, BOOL head,
                      BOOL *retry) {
     wchar_t url[URL_CAP], host[256], path[URL_CAP];
     StringCchCopyW(url, URL_CAP, first);
@@ -122,9 +122,10 @@ static BOOL download(Job *j, const wchar_t *first, const wchar_t *temp, uint64_t
                                                  u.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0)
                             : NULL;
         DWORD redirects = WINHTTP_OPTION_REDIRECT_POLICY_NEVER, code = 0, size = sizeof code;
+        DWORD disabled = WINHTTP_DISABLE_AUTHENTICATION | WINHTTP_DISABLE_COOKIES;
         BOOL again = FALSE, ok = FALSE;
-        HANDLE file = INVALID_HANDLE_VALUE;
         if (!req || !WinHttpSetOption(req, WINHTTP_OPTION_REDIRECT_POLICY, &redirects, sizeof redirects) ||
+            !WinHttpSetOption(req, WINHTTP_OPTION_DISABLE_FEATURE, &disabled, sizeof disabled) ||
             !WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
             !WinHttpReceiveResponse(req, NULL) ||
             !WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, NULL, &code,
@@ -142,14 +143,17 @@ static BOOL download(Job *j, const wchar_t *first, const wchar_t *temp, uint64_t
                 error(j, L"Ungültige Weiterleitung.");
                 goto finish;
             }
-            if (j->key[0]) {
-                URL_COMPONENTSW target;
-                wchar_t next_host[256], next_path[URL_CAP];
-                if (!split_url(next, &target, next_host, next_path) || _wcsicmp(host, next_host) ||
-                    target.nPort != u.nPort || target.nScheme != u.nScheme) {
-                    error(j, L"Anbieterwechsel beim Download mit API-Key abgelehnt.");
-                    goto finish;
-                }
+            URL_COMPONENTSW target;
+            wchar_t next_host[256], next_path[URL_CAP];
+            if (!split_url(next, &target, next_host, next_path) ||
+                (u.nScheme == INTERNET_SCHEME_HTTPS && target.nScheme != INTERNET_SCHEME_HTTPS)) {
+                error(j, L"Die Weiterleitung führt zu einer unzulässigen oder unverschlüsselten Adresse.");
+                goto finish;
+            }
+            if (j->key[0] && (_wcsicmp(host, next_host) || target.nPort != u.nPort ||
+                              target.nScheme != u.nScheme)) {
+                error(j, L"Anbieterwechsel beim Download mit API-Key abgelehnt.");
+                goto finish;
             }
             StringCchCopyW(url, URL_CAP, next);
             again = TRUE;
@@ -190,9 +194,9 @@ static BOOL download(Job *j, const wchar_t *first, const wchar_t *temp, uint64_t
             error(j, L"Nicht genügend freier Speicherplatz.");
             goto finish;
         }
-        file = CreateFileW(temp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
-        if (file == INVALID_HANDLE_VALUE) {
-            win_error(j, L"Temporäre Datei konnte nicht geöffnet werden");
+        LARGE_INTEGER beginning = {.QuadPart = 0};
+        if (!SetFilePointerEx(file, beginning, NULL, FILE_BEGIN) || !SetEndOfFile(file)) {
+            win_error(j, L"Temporäre Datei konnte nicht beschrieben werden");
             goto finish;
         }
         unsigned char buffer[65536];
@@ -234,8 +238,6 @@ static BOOL download(Job *j, const wchar_t *first, const wchar_t *temp, uint64_t
         if (ok && !FlushFileBuffers(file))
             ok = win_error(j, L"Datei konnte nicht gespeichert werden");
     finish:
-        if (file != INVALID_HANDLE_VALUE)
-            CloseHandle(file);
         if (req)
             WinHttpCloseHandle(req);
         if (conn)
@@ -245,20 +247,29 @@ static BOOL download(Job *j, const wchar_t *first, const wchar_t *temp, uint64_t
     }
     return error(j, L"Download abgebrochen oder zu viele Weiterleitungen.");
 }
+static HANDLE new_temp(const wchar_t *target, wchar_t path[MAP_PATH]) {
+    GUID guid;
+    wchar_t unique[40];
+    if (FAILED(CoCreateGuid(&guid)) || !StringFromGUID2(&guid, unique, ARRAYSIZE(unique)) ||
+        FAILED(StringCchPrintfW(path, MAP_PATH, L"%ls.%ls.tmp", target, unique)))
+        return INVALID_HANDLE_VALUE;
+    return CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+}
 static BOOL transfer(Job *j, const wchar_t *url, const wchar_t *target, BOOL tile) {
-    wchar_t dir[MAP_PATH], temp[MAP_PATH];
-    StringCchCopyW(dir, MAP_PATH, target);
-    if (!PathRemoveFileSpecW(dir) || !GetTempFileNameW(dir, L"gv", 0, temp))
+    wchar_t temp[MAP_PATH];
+    HANDLE file = new_temp(target, temp);
+    if (file == INVALID_HANDLE_VALUE)
         return win_error(j, L"Temporäre Datei konnte nicht erstellt werden");
     BOOL ok = FALSE;
     for (int i = 0; i < 3 && !cancelled(j); i++) {
         BOOL retry;
-        ok = download(j, url, temp, tile ? LIMIT_TILE : LIMIT_FILE, FALSE, &retry);
+        ok = download(j, url, temp, file, tile ? LIMIT_TILE : LIMIT_FILE, FALSE, &retry);
         if (ok || !retry)
             break;
         for (int pause = 0; pause < 5 * (i + 1) && !cancelled(j); pause++)
             Sleep(100);
     }
+    CloseHandle(file);
     if (ok) {
         if (tile) {
             if (!map_valid_tile(temp))
@@ -325,10 +336,11 @@ static BOOL url_tile(Job *j, wchar_t *out, int z, int x, int y) {
 }
 static BOOL write_metadata(Job *j, const wchar_t *name, const wchar_t *value) {
     wchar_t target[MAP_PATH], tmp[MAP_PATH];
-    if (FAILED(StringCchPrintfW(target, MAP_PATH, L"%ls\\%ls", j->target, name)) ||
-        !GetTempFileNameW(j->target, L"gv", 0, tmp))
+    if (FAILED(StringCchPrintfW(target, MAP_PATH, L"%ls\\%ls", j->target, name)))
+        return error(j, L"Zielpfad zu lang.");
+    HANDLE file = new_temp(target, tmp);
+    if (file == INVALID_HANDLE_VALUE)
         return win_error(j, L"Karteninformationen konnten nicht angelegt werden");
-    HANDLE file = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     char bytes[2048];
     int n = WideCharToMultiByte(CP_UTF8, 0, value, -1, bytes, sizeof bytes, NULL, NULL);
     DWORD written = 0;
@@ -394,33 +406,50 @@ static BOOL verify_provider(Job *j) {
                         L"mit gleichem Anbieter können fortgesetzt werden.");
     return write_metadata(j, L"geovoice-source.txt", expected);
 }
-static BOOL directory_exists(const wchar_t *path) {
-    DWORD attrs = GetFileAttributesW(path);
-    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+/* Keep each directory in the active XYZ path in place until its files are published. */
+static HANDLE hold_directory(const wchar_t *path, BOOL create) {
+    if (create && !CreateDirectoryW(path, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+        return INVALID_HANDLE_VALUE;
+    HANDLE h = CreateFileW(path, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                           FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        BY_HANDLE_FILE_INFORMATION info;
+        if (GetFileInformationByHandle(h, &info) && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+            return h;
+        CloseHandle(h);
+    }
+    return INVALID_HANDLE_VALUE;
 }
-static BOOL make_dir(const wchar_t *path) { return CreateDirectoryW(path, NULL) || directory_exists(path); }
 static BOOL raster_tiles(Job *j) {
     int failures = 0;
+    HANDLE level_dir = INVALID_HANDLE_VALUE, column_dir = INVALID_HANDLE_VALUE;
     for (int z = j->zmin; z <= j->zmax && !cancelled(j); z++) {
         Range r = tile_range(j, z);
         int n = 1 << z;
         wchar_t level[MAP_PATH];
-        if (FAILED(StringCchPrintfW(level, MAP_PATH, L"%ls\\%d", j->target, z)) || !make_dir(level))
+        if (FAILED(StringCchPrintfW(level, MAP_PATH, L"%ls\\%d", j->target, z)) ||
+            (level_dir = hold_directory(level, TRUE)) == INVALID_HANDLE_VALUE)
             return error(j, L"Zoomordner konnte nicht angelegt werden.");
         for (int col = r.first; col <= r.last && !cancelled(j); col++) {
             int x = (col % n + n) % n;
             wchar_t column[MAP_PATH];
-            if (FAILED(StringCchPrintfW(column, MAP_PATH, L"%ls\\%d", level, x)) || !make_dir(column))
-                return error(j, L"Kachelordner konnte nicht angelegt werden.");
+            if (FAILED(StringCchPrintfW(column, MAP_PATH, L"%ls\\%d", level, x)) ||
+                (column_dir = hold_directory(column, TRUE)) == INVALID_HANDLE_VALUE) {
+                error(j, L"Kachelordner ist nicht beschreibbar oder verweist auf einen anderen Ort.");
+                goto cleanup;
+            }
             for (int y = r.top; y <= r.bottom && !cancelled(j); y++) {
                 wchar_t path[MAP_PATH], url[URL_CAP];
                 if (FAILED(StringCchPrintfW(path, MAP_PATH, L"%ls\\%d.png", column, y)) ||
-                    !url_tile(j, url, z, x, y))
-                    return error(j, L"Dateipfad oder URL ist zu lang.");
+                    !url_tile(j, url, z, x, y)) {
+                    error(j, L"Dateipfad oder URL ist zu lang.");
+                    goto cleanup;
+                }
                 if (!map_valid_tile(path)) {
                     if (!transfer(j, url, path, TRUE)) {
                         if (cancelled(j))
-                            return FALSE;
+                            goto cleanup;
                         /* Preserve valid previous tiles and report the specific cause. */
                         failures++;
                         if (failures >= 3 || j->received >= LIMIT_XYZ)
@@ -431,10 +460,14 @@ static BOOL raster_tiles(Job *j) {
                 j->done++;
                 progress(j, 0, 0);
             }
+            CloseHandle(column_dir);
+            column_dir = INVALID_HANDLE_VALUE;
         }
+        CloseHandle(level_dir);
+        level_dir = INVALID_HANDLE_VALUE;
     }
     if (cancelled(j))
-        return FALSE;
+        goto cleanup;
     if (failures)
         goto failed;
     wchar_t center[82];
@@ -452,19 +485,30 @@ failed:
         StringCchPrintfW(j->result, ARRAYSIZE(j->result),
                          L"Unvollständig. %d Kacheln neu, %d fehlgeschlagen. %.340ls", j->loaded, failures,
                          why);
-        return FALSE;
     }
+cleanup:
+    if (column_dir != INVALID_HANDLE_VALUE)
+        CloseHandle(column_dir);
+    if (level_dir != INVALID_HANDLE_VALUE)
+        CloseHandle(level_dir);
+    return FALSE;
 }
 static BOOL raster(Job *j) {
     wchar_t lockpath[MAP_PATH];
     if (FAILED(StringCchPrintfW(lockpath, MAP_PATH, L"%ls\\.geovoice-download.lock", j->target)))
         return error(j, L"Zielpfad ist zu lang.");
-    HANDLE guard = CreateFileW(lockpath, GENERIC_READ | GENERIC_WRITE | DELETE, 0, NULL, OPEN_ALWAYS,
-                               FILE_ATTRIBUTE_HIDDEN | FILE_FLAG_DELETE_ON_CLOSE, NULL);
-    if (guard == INVALID_HANDLE_VALUE)
+    HANDLE root = hold_directory(j->target, FALSE);
+    if (root == INVALID_HANDLE_VALUE)
+        return error(j, L"Ein normaler, zugänglicher Zielordner wird benötigt.");
+    HANDLE guard = CreateFileW(lockpath, FILE_READ_ATTRIBUTES, 0, NULL, OPEN_ALWAYS,
+                               FILE_ATTRIBUTE_HIDDEN | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (guard == INVALID_HANDLE_VALUE) {
+        CloseHandle(root);
         return win_error(j, L"Zielordner ist belegt oder schreibgeschützt");
+    }
     BOOL ok = verify_provider(j) && write_metadata(j, L"attribution.txt", j->credit) && raster_tiles(j);
     CloseHandle(guard);
+    CloseHandle(root);
     return ok;
 }
 static DWORD WINAPI run_job(void *arg) {
@@ -475,7 +519,7 @@ static DWORD WINAPI run_job(void *arg) {
         WinHttpSetTimeouts(j->session, 5000, 10000, 10000, 15000);
         if (j->mode == INFO_JOB) {
             BOOL retry;
-            j->success = download(j, j->url, NULL, 0, TRUE, &retry);
+            j->success = download(j, j->url, NULL, INVALID_HANDLE_VALUE, 0, TRUE, &retry);
         } else if (j->mode == FILE_JOB) {
             j->success = transfer(j, j->url, j->target, FALSE);
             if (j->success)
@@ -574,14 +618,17 @@ static BOOL read_metadata(const wchar_t *dir, const wchar_t *name, wchar_t *out,
     if (FAILED(StringCchPrintfW(path, MAP_PATH, L"%ls\\%ls", dir, name)))
         return FALSE;
     HANDLE f =
-        CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (f == INVALID_HANDLE_VALUE)
         return FALSE;
     char bytes[2048];
     DWORD n = 0;
-    BOOL ok = ReadFile(f, bytes, sizeof bytes - 1, &n, NULL);
+    BY_HANDLE_FILE_INFORMATION info;
+    BOOL ok = GetFileType(f) == FILE_TYPE_DISK && GetFileInformationByHandle(f, &info) &&
+              !(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) &&
+              ReadFile(f, bytes, sizeof bytes - 1, &n, NULL);
     CloseHandle(f);
-    if (!ok || !n || n == sizeof bytes - 1)
+    if (!ok || !n || n == sizeof bytes - 1 || memchr(bytes, 0, n))
         return FALSE;
     bytes[n] = 0;
     const char *s = bytes;
@@ -604,17 +651,20 @@ static BOOL coordinate(HWND d, int id, double limit, double *out) {
 }
 static BOOL encode_key(Job *j, const wchar_t *name) {
     wchar_t value[512];
+    char bytes[1536];
+    BOOL ok = FALSE;
     DWORD n = GetEnvironmentVariableW(name, value, ARRAYSIZE(value));
     if (!n || n >= ARRAYSIZE(value))
-        return FALSE;
-    char bytes[1536];
-    int count = WideCharToMultiByte(CP_UTF8, 0, value, n, bytes, sizeof bytes, NULL, NULL);
+        goto cleanup;
+    int count = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, n, bytes, sizeof bytes, NULL, NULL);
+    if (!count)
+        goto cleanup;
     size_t used = 0;
     static const wchar_t digits[] = L"0123456789ABCDEF";
     for (int i = 0; i < count; i++) {
         unsigned c = (unsigned char)bytes[i];
         if (used + 3 >= ARRAYSIZE(j->key))
-            return FALSE;
+            goto cleanup;
         if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
             strchr("-._~", (int)c))
             j->key[used++] = (wchar_t)c;
@@ -625,9 +675,11 @@ static BOOL encode_key(Job *j, const wchar_t *name) {
         }
     }
     j->key[used] = 0;
+    ok = TRUE;
+cleanup:
     SecureZeroMemory(value, sizeof value);
     SecureZeroMemory(bytes, sizeof bytes);
-    return TRUE;
+    return ok;
 }
 static BOOL raster_spec(Job *j, BOOL estimate) {
     HWND d = j->dialog;
@@ -667,14 +719,15 @@ static BOOL raster_spec(Job *j, BOOL estimate) {
         return FALSE;
     }
     if (wcsstr(j->url, L"{apiKey}")) {
+        const wchar_t *resource = !_wcsnicmp(j->url, L"https://", 8) ? wcspbrk(j->url + 8, L"/?") : NULL;
+        if (!resource || wcsstr(j->url, L"{apiKey}") < resource) {
+            notice(d, L"Den API-Key nur im Pfad oder in der Abfrage einer HTTPS-Adresse einsetzen.");
+            return FALSE;
+        }
         wchar_t env[128];
         GetDlgItemTextW(d, M_ENV, env, ARRAYSIZE(env));
         if (!encode_key(j, env)) {
             notice(d, L"Die Umgebungsvariable für den API-Key fehlt oder ihr Inhalt ist zu lang.");
-            return FALSE;
-        }
-        if (_wcsnicmp(j->url, L"https://", 8)) {
-            notice(d, L"Für die Übertragung eines API-Keys ist HTTPS erforderlich.");
             return FALSE;
         }
     }
@@ -699,8 +752,10 @@ static void begin(Job *j, Mode mode) {
     j->target[0] = 0;
     j->result[0] = 0;
     if (mode == XYZ_JOB) {
-        if (!raster_spec(j, FALSE))
+        if (!raster_spec(j, FALSE)) {
+            SecureZeroMemory(j->key, sizeof j->key);
             return;
+        }
     } else {
         GetDlgItemTextW(d, M_URL, j->url, URL_CAP);
         if (!j->url[0]) {
@@ -714,6 +769,10 @@ static void begin(Job *j, Mode mode) {
             StringCchPrintfW(j->target, MAP_PATH, L"%ls.map", slugs[ix]);
             if (!choose_file(d, j->target, TRUE))
                 return;
+            if (_wcsicmp(PathFindExtensionW(j->target), L".map")) {
+                notice(d, L"Ein Kartenpaket bitte mit der Dateiendung .map speichern.");
+                return;
+            }
         }
     }
     j->received = 0;
@@ -723,15 +782,21 @@ static void begin(Job *j, Mode mode) {
     j->success = FALSE;
     InterlockedExchange(&j->cancel, 0);
     report(j, L"Verbindung wird hergestellt …");
+    if (!SetTimer(d, 1, 150, NULL)) {
+        SecureZeroMemory(j->key, sizeof j->key);
+        notice(d, L"Download konnte nicht gestartet werden.");
+        return;
+    }
     controls(d, FALSE);
     notice(d, L"Verbindung wird hergestellt …");
     j->thread = CreateThread(NULL, 0, run_job, j, 0, NULL);
     if (!j->thread) {
+        KillTimer(d, 1);
+        SecureZeroMemory(j->key, sizeof j->key);
         controls(d, TRUE);
         notice(d, L"Download konnte nicht gestartet werden.");
         return;
     }
-    SetTimer(d, 1, 150, NULL);
 }
 static void finish_job(Job *j) {
     HWND d = j->dialog;
@@ -881,6 +946,14 @@ void map_dialog(HWND canvas) {
     HRESULT com = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     DialogBoxParamW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDD_MAP), GetAncestor(canvas, GA_ROOT),
                     dialog_proc, (LPARAM)&j);
+    /* The owner may be destroyed while the modal window still has an active transfer. */
+    if (j.thread) {
+        InterlockedExchange(&j.cancel, 1);
+        CancelSynchronousIo(j.thread);
+        WaitForSingleObject(j.thread, INFINITE);
+        CloseHandle(j.thread);
+    }
+    SecureZeroMemory(j.key, sizeof j.key);
     if (SUCCEEDED(com))
         CoUninitialize();
     DeleteCriticalSection(&j.lock);

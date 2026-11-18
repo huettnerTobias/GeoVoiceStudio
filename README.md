@@ -16,6 +16,10 @@ Mit GeoVoice Studio bereitest du am PC Offlinekarten, Routen und Ansagen für de
 
 Bestätigte Änderungen speichert das Studio unter `%APPDATA%\GeoVoiceStudioC`. Zur Sicherung das Studio schließen und diesen Ordner kopieren. Die gewählte Kartenquelle wird für das Windows-Benutzerkonto gespeichert. Direkt geöffnete Karten bleiben an ihrem ursprünglichen Speicherort. Für einen getrennten Routendatenbestand kann vor dem Start die Umgebungsvariable `GEOVOICE_STUDIO_DIR` auf einen absoluten Verzeichnispfad gesetzt werden.
 
+Der Route-Code schützt die Bearbeitung in der Oberfläche. Den Zugriff auf die Bibliothek selbst regeln die Windows-Dateiberechtigungen. Bestehende Zugangscodes funktionieren weiter. Wenn du sie unter **Werkzeuge → Zugangscodes verwalten** neu speicherst, verwendet das Studio für beide Prüfsummen PBKDF2-HMAC-SHA‑256 mit 600.000 Iterationen und jeweils eigenem zufälligem Salt.
+
+Beim Import prüft das Studio die SHA-256-Prüfsummen der Audiodateien gegen das Paketmanifest. Die Herkunft eines USB-Pakets lässt sich damit nicht bestätigen.
+
 ## In CLion bauen
 
 Öffne die `CMakeLists.txt` in CLion und wähle die mitgelieferte MinGW-Toolchain für Windows x64. Das Startziel heißt **GeoVoiceStudio**. Für die verteilbare EXE verwende das Profil **Release**.

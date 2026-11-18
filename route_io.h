@@ -33,6 +33,11 @@ int gv_export(const GvLibrary *lib, size_t index, const wchar_t *path);
 int gv_export_all(const GvLibrary *lib, const wchar_t *path);
 /* Package file or Java data directory. -1 requests replacement confirmation. */
 int gv_import(GvLibrary *lib, const wchar_t *path, int replace);
+/* Keep the target library exclusively owned until finish. A prepared plan owns
+   its staged files. Finish exactly once, including after a declined replacement. */
+typedef struct GvImportPlan GvImportPlan;
+int gv_prepare_import(GvLibrary *lib, const wchar_t *path, GvImportPlan **out);
+int gv_finish_import(GvImportPlan *plan, int install);
 int gv_import_audio(const GvLibrary *lib, const wchar_t *path, wchar_t outName[256]);
 int gv_audio_path(const GvLibrary *lib, const wchar_t *name, wchar_t out[GV_AUDIO_PATH]);
 int gv_rename_audio(GvLibrary *lib, const wchar_t *oldName, const wchar_t *newName);
