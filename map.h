@@ -3,7 +3,10 @@
 #include <windows.h>
 #include <stddef.h>
 
-typedef struct { double lat, lon; const wchar_t *name; } MapPoint;
+typedef struct {
+    double lat, lon;
+    const wchar_t *name;
+} MapPoint;
 typedef void (*MapPick)(double lat, double lon, void *context);
 HWND map_create(HWND parent, int id, MapPick pick, void *context);
 void map_points(HWND canvas, const MapPoint *points, size_t count, int selected);
