@@ -19,10 +19,14 @@ target_include_directories(geovoice_routes PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(geovoice_routes PRIVATE YYJSON_READER_DEPTH_LIMIT=64)
 target_link_libraries(geovoice_routes PRIVATE bcrypt ole32)
 
+add_library(geovoice_raster STATIC map_corridor.c map_image.c mbtiles.c)
+target_include_directories(geovoice_raster PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(geovoice_raster PRIVATE gdiplus gdi32)
+
 add_executable(GeoVoiceStudio WIN32
     main.c studio_dialogs.c studio_access.c studio_transfer.c studio.rc
-    map.c map_vector.c map_download.c map_dialog.rc)
-target_link_libraries(GeoVoiceStudio PRIVATE geovoice_routes comctl32 comdlg32 shell32 shlwapi winmm
+    map.c map_vector.c map_download.c map_orthofoto.c map_dialog.rc)
+target_link_libraries(GeoVoiceStudio PRIVATE geovoice_routes geovoice_raster comctl32 comdlg32 shell32 shlwapi winmm
     gdiplus winhttp ole32 advapi32 bcrypt gdi32 user32 uuid)
 if(MINGW)
     target_link_options(GeoVoiceStudio PRIVATE -municode -static "$<$<CONFIG:Release>:-s>")
@@ -36,6 +40,19 @@ if(BUILD_TESTING)
         target_link_options(route_roundtrip PRIVATE -static)
     endif()
     add_test(NAME route_roundtrip COMMAND route_roundtrip)
+    add_executable(mbtiles_import tests/mbtiles_import.c)
+    target_link_libraries(mbtiles_import PRIVATE geovoice_raster ole32 shell32)
+    if(MINGW)
+        target_link_options(mbtiles_import PRIVATE -static)
+    endif()
+    add_test(NAME mbtiles_import COMMAND mbtiles_import)
+
+    add_executable(orthofoto_publish tests/orthofoto_publish.c map_orthofoto.c)
+    target_link_libraries(orthofoto_publish PRIVATE ole32 shell32)
+    if(MINGW)
+        target_link_options(orthofoto_publish PRIVATE -static)
+    endif()
+    add_test(NAME orthofoto_publish COMMAND orthofoto_publish)
 endif()
 
 install(TARGETS GeoVoiceStudio RUNTIME DESTINATION .)

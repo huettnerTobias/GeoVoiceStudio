@@ -7,6 +7,22 @@
 #define MAP_CREDIT L"© OpenStreetMap contributors · openstreetmap.org/copyright"
 #define MAP_PATH 2048
 
+/* Keep each directory in the active XYZ path in place until its files are published. */
+static inline HANDLE map_hold_directory(const wchar_t *path, BOOL create) {
+    if (create && !CreateDirectoryW(path, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+        return INVALID_HANDLE_VALUE;
+    HANDLE h = CreateFileW(path, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                           FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        BY_HANDLE_FILE_INFORMATION info;
+        if (GetFileInformationByHandle(h, &info) && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+            return h;
+        CloseHandle(h);
+    }
+    return INVALID_HANDLE_VALUE;
+}
+
 /* Normalized Web Mercator coordinates, independent of pixel size and zoom. */
 static inline double map_x(double lon) { return (lon + 180.) / 360.; }
 static inline double map_y(double lat) {
@@ -27,5 +43,5 @@ BOOL map_use_directory(HWND canvas, const wchar_t *path, const wchar_t *credit, 
                        int z);
 void map_current(HWND canvas, wchar_t *path, size_t cap, double *lat, double *lon);
 BOOL map_valid_tile(const wchar_t *path);
-void map_dialog(HWND canvas);
+void map_dialog(HWND canvas, const GvRoute *route);
 #endif

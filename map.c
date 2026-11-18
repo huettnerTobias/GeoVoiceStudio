@@ -1,7 +1,9 @@
 #include "map_internal.h"
 #include <windowsx.h>
-#include <objidl.h>
-#include <gdiplus.h>
+#include "map_image.h"
+#include "map_orthofoto.h"
+#include <commctrl.h>
+#include <shellapi.h>
 #include <strsafe.h>
 #include <stdlib.h>
 #include <float.h>
@@ -13,6 +15,7 @@ typedef struct {
     LONG refs;
     MapVector *vector;
     wchar_t path[MAP_PATH], credit[512];
+    unsigned zoom_levels;
 } Source;
 typedef struct {
     int x, y, z;
@@ -25,7 +28,8 @@ typedef struct {
     wchar_t *name;
 } Marker;
 typedef struct {
-    HWND window;
+    HWND window, credit_link;
+    int credit_height;
     MapPick pick;
     void *context;
     double x, y;
@@ -44,6 +48,33 @@ typedef struct {
 } Canvas;
 
 static Canvas *canvas(HWND window) { return (Canvas *)GetWindowLongPtrW(window, GWLP_USERDATA); }
+static int available_zoom(unsigned levels, int wanted, int step, int fallback) {
+    for (int z = wanted; z >= 0 && z <= 20; z += step)
+        if ((levels >> z) & 1u)
+            return z;
+    return fallback;
+}
+static int fit_zoom(unsigned levels, int wanted) {
+    if (!levels || ((levels >> wanted) & 1u))
+        return wanted;
+    int lower = available_zoom(levels, wanted - 1, -1, -1);
+    return lower >= 0 ? lower : available_zoom(levels, wanted + 1, 1, wanted);
+}
+static void layout_credit(Canvas *c) {
+    RECT r;
+    SIZE size = {0};
+    if (!c || !c->credit_link)
+        return;
+    HDC dc = GetDC(c->credit_link);
+    HGDIOBJ old = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+    GetTextExtentPoint32W(dc, ORTHOFOTO_CREDIT, ARRAYSIZE(ORTHOFOTO_CREDIT) - 1, &size);
+    SelectObject(dc, old);
+    ReleaseDC(c->credit_link, dc);
+    GetClientRect(c->window, &r);
+    int width = min(r.right, size.cx + 12);
+    c->credit_height = max(20, size.cy + 3);
+    MoveWindow(c->credit_link, r.right - width, r.bottom - c->credit_height, width, c->credit_height, TRUE);
+}
 static void release(Source *s) {
     if (s && !InterlockedDecrement(&s->refs)) {
         map_vector_close(s->vector);
@@ -53,41 +84,6 @@ static void release(Source *s) {
 static void color_fill(HDC dc, RECT rect, COLORREF col) {
     SetDCBrushColor(dc, col);
     FillRect(dc, &rect, GetStockObject(DC_BRUSH));
-}
-static GpImage *tile_image(const wchar_t *path) {
-    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-    if (file == INVALID_HANDLE_VALUE)
-        return NULL;
-    BY_HANDLE_FILE_INFORMATION info;
-    unsigned char header[8];
-    DWORD n;
-    BOOL accepted = GetFileType(file) == FILE_TYPE_DISK && GetFileInformationByHandle(file, &info) &&
-                    !info.nFileSizeHigh && info.nFileSizeLow <= 2 * 1024 * 1024 &&
-                    !(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) &&
-                    ReadFile(file, header, sizeof header, &n, NULL) && n == sizeof header &&
-                    (!memcmp(header, "\x89PNG\r\n\x1a\n", 8) || !memcmp(header, "\xff\xd8\xff", 3));
-    GpImage *im = NULL;
-    UINT w = 0, h = 0;
-    GpStatus loaded = accepted ? GdipLoadImageFromFile(path, &im) : UnknownImageFormat;
-    CloseHandle(file);
-    if (loaded != Ok || !im)
-        return NULL;
-    if (GdipGetImageWidth(im, &w) != Ok || GdipGetImageHeight(im, &h) != Ok || w != 256 || h != 256) {
-        GdipDisposeImage(im);
-        return NULL;
-    }
-    return im;
-}
-BOOL map_valid_tile(const wchar_t *path) {
-    GpImage *im = tile_image(path);
-    if (!im)
-        return FALSE;
-    HBITMAP decoded = NULL;
-    GpStatus result = GdipCreateHBITMAPFromBitmap((GpBitmap *)im, &decoded, 0);
-    if (decoded)
-        DeleteObject(decoded);
-    GdipDisposeImage(im);
-    return result == Ok;
 }
 static HBITMAP draw_tile(Source *s, Tile t) {
     BITMAPINFO info = {.bmiHeader = {.biSize = sizeof(BITMAPINFOHEADER),
@@ -122,7 +118,7 @@ static HBITMAP draw_tile(Source *s, Tile t) {
         const wchar_t *exts[] = {L"png", L"jpg", L"jpeg"};
         for (int i = 0; i < 3 && !im; i++) {
             StringCchPrintfW(path, ARRAYSIZE(path), L"%ls\\%d\\%d\\%d.%ls", s->path, t.z, t.x, t.y, exts[i]);
-            im = tile_image(path);
+            im = map_tile_image(path);
         }
         if (im) {
             GpGraphics *g = NULL;
@@ -215,6 +211,7 @@ static void source(Canvas *c, Source *s, double lat, double lon, int z) {
     c->x = map_x(lon);
     c->y = map_y(lat);
     c->zoom = z;
+    ShowWindow(c->credit_link, wcscmp(s->credit, ORTHOFOTO_CREDIT) == 0 ? SW_SHOWNOACTIVATE : SW_HIDE);
     HKEY key;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, MAP_REG, 0, NULL, 0, KEY_WRITE, NULL, &key, NULL) ==
         ERROR_SUCCESS) {
@@ -263,7 +260,18 @@ BOOL map_use_directory(HWND window, const wchar_t *path, const wchar_t *credit, 
         return FALSE;
     }
     StringCchCopyW(s->credit, ARRAYSIZE(s->credit), credit);
-    source(c, s, lat, lon, (int)fmax(0, fmin(20, z)));
+    if (wcscmp(credit, ORTHOFOTO_CREDIT) == 0) {
+        for (int level = 0; level <= 20; ++level) {
+            wchar_t dir[MAP_PATH];
+            if (FAILED(StringCchPrintfW(dir, MAP_PATH, L"%ls\\%d", path, level)))
+                break;
+            DWORD attr = GetFileAttributesW(dir);
+            if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) &&
+                !(attr & FILE_ATTRIBUTE_REPARSE_POINT))
+                s->zoom_levels |= 1u << level;
+        }
+    }
+    source(c, s, lat, lon, fit_zoom(s->zoom_levels, (int)fmax(0, fmin(20, z))));
     return TRUE;
 }
 void map_current(HWND window, wchar_t *path, size_t cap, double *lat, double *lon) {
@@ -444,11 +452,17 @@ static void render(Canvas *c, HDC dc, RECT r) {
         DrawTextW(dc, L"Offlinekarte über „Offlinekarten…“ öffnen", -1, &hint, DT_LEFT | DT_TOP | DT_SINGLELINE);
     }
     route_overlay(c, dc, r, scale);
+    BOOL linked = c->credit_link && c->source && wcscmp(c->source->credit, ORTHOFOTO_CREDIT) == 0;
     wchar_t status[720];
     StringCchPrintfW(status, ARRAYSIZE(status), L"%.5f°, %.5f°   ·   Zoom %d   %ls", map_lat(c->y),
-                     map_lon(c->x), c->zoom, c->source ? c->source->credit : L"");
-    RECT strip = {0, r.bottom - 20, r.right, r.bottom};
+                     map_lon(c->x), c->zoom, c->source && !linked ? c->source->credit : L"");
+    RECT strip = {0, r.bottom - (linked ? c->credit_height : 20), r.right, r.bottom};
     color_fill(dc, strip, RGB(251, 251, 248));
+    if (linked) {
+        RECT link;
+        GetWindowRect(c->credit_link, &link);
+        strip.right -= link.right - link.left;
+    }
     strip.left += 5;
     SetTextColor(dc, RGB(43, 58, 54));
     DrawTextW(dc, status, -1, &strip, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER | DT_END_ELLIPSIS);
@@ -509,7 +523,9 @@ void map_fit(HWND window) {
     GetClientRect(window, &r);
     double xScale = fmax(40., r.right - 80.) / fmax(1e-8, hiX - loX),
            yScale = fmax(40., r.bottom - 65.) / fmax(1e-8, hiY - loY);
-    c->zoom = (int)fmax(0., fmin(16., floor(log2(fmin(xScale, yScale) / 256.))));
+    unsigned levels = c->source ? c->source->zoom_levels : 0;
+    int wanted = (int)fmax(0., fmin(levels ? 20. : 16., floor(log2(fmin(xScale, yScale) / 256.))));
+    c->zoom = fit_zoom(levels, wanted);
     c->x = (loX + hiX) / 2.;
     c->x -= floor(c->x);
     c->y = (loY + hiY) / 2.;
@@ -518,7 +534,9 @@ void map_fit(HWND window) {
 void map_zoom(HWND window, int delta) {
     Canvas *c = canvas(window);
     if (c) {
-        c->zoom = (int)fmax(0., fmin(20., c->zoom + delta));
+        int wanted = (int)fmax(0., fmin(20., c->zoom + delta));
+        unsigned levels = c->source ? c->source->zoom_levels : 0;
+        c->zoom = levels ? available_zoom(levels, wanted, delta >= 0 ? 1 : -1, c->zoom) : wanted;
         InvalidateRect(window, NULL, FALSE);
     }
 }
@@ -530,9 +548,9 @@ void map_overlay(HWND window, BOOL lines, BOOL labels) {
         InvalidateRect(window, NULL, FALSE);
     }
 }
-void map_manage(HWND window) {
+void map_manage(HWND window, const GvRoute *route) {
     if (canvas(window))
-        map_dialog(window);
+        map_dialog(window, route);
 }
 static void pan(Canvas *c, int dx, int dy) {
     double scale = ldexp(256., c->zoom);
@@ -551,6 +569,26 @@ static LRESULT CALLBACK window_proc(HWND window, UINT msg, WPARAM wp, LPARAM lp)
         return TRUE;
     case WM_ERASEBKGND:
         return 1;
+    case WM_SIZE:
+        layout_credit(c);
+        return 0;
+    case WM_CTLCOLORSTATIC:
+        if ((HWND)lp == c->credit_link) {
+            SetBkColor((HDC)wp, RGB(251, 251, 248));
+            SetDCBrushColor((HDC)wp, RGB(251, 251, 248));
+            return (LRESULT)GetStockObject(DC_BRUSH);
+        }
+        break;
+    case WM_NOTIFY: {
+        const NMLINK *link = (const NMLINK *)lp;
+        if (link->hdr.hwndFrom == c->credit_link && (link->hdr.code == NM_CLICK || link->hdr.code == NM_RETURN)) {
+            const wchar_t *url = link->item.iLink == 0 ? ORTHOFOTO_PROVIDER : ORTHOFOTO_LICENCE;
+            if ((INT_PTR)ShellExecuteW(window, L"open", url, NULL, NULL, SW_SHOWNORMAL) <= 32)
+                MessageBoxW(window, url, L"Link im Browser öffnen", MB_OK | MB_ICONINFORMATION);
+            return 0;
+        }
+        break;
+    }
     case TILE_READY:
         InvalidateRect(window, NULL, FALSE);
         return 0;
@@ -700,7 +738,7 @@ HWND map_create(HWND parent, int id, MapPick pick, void *context) {
         return NULL;
     }
     HWND window = CreateWindowExW(WS_EX_CLIENTEDGE, wc.lpszClassName, L"Kartenansicht",
-                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 100, 100, parent,
+                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPCHILDREN, 0, 0, 100, 100, parent,
                                   (HMENU)(INT_PTR)id, instance, c);
     if (!window) {
         GdiplusShutdown(c->gdiplus);
@@ -708,6 +746,14 @@ HWND map_create(HWND parent, int id, MapPick pick, void *context) {
         DeleteCriticalSection(&c->lock);
         free(c);
         return NULL;
+    }
+    c->credit_link = CreateWindowExW(0, WC_LINK,
+                                     L"Datenquelle: <a href=\"" ORTHOFOTO_PROVIDER L"\">basemap.at</a>"
+                                     L" · <a href=\"" ORTHOFOTO_LICENCE L"\">CC BY 4.0</a>",
+                                     WS_CHILD | WS_TABSTOP, 0, 0, 1, 1, window, NULL, instance, NULL);
+    if (c->credit_link) {
+        SendMessageW(c->credit_link, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), FALSE);
+        layout_credit(c);
     }
     c->worker = CreateThread(NULL, 0, render_worker, c, 0, NULL);
     if (!c->worker) {

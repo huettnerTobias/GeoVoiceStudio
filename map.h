@@ -2,6 +2,7 @@
 #define GEOVOICE_MAP_H
 #include <windows.h>
 #include <stddef.h>
+#include "route_io.h"
 
 typedef struct {
     double lat, lon;
@@ -15,5 +16,5 @@ void map_center(HWND canvas, double lat, double lon);
 void map_fit(HWND canvas);
 void map_zoom(HWND canvas, int delta);
 void map_overlay(HWND canvas, BOOL lines, BOOL labels);
-void map_manage(HWND canvas);
+void map_manage(HWND canvas, const GvRoute *route);
 #endif

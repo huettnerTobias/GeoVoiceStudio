@@ -400,7 +400,7 @@ static void command(int id, int event) {
         refresh(FALSE);
         break;
     case ID_MAPS:
-        map_manage(canvas);
+        map_manage(canvas, route());
         break;
     case ID_FILE_IMPORT:
     case ID_FILE_LEGACY:
@@ -559,7 +559,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR args, int show
     if (FAILED(OleInitialize(NULL)))
         return 1;
     INITCOMMONCONTROLSEX controls = {sizeof(controls),
-                                     ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS};
+                                     ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS | ICC_LINK_CLASS};
     InitCommonControlsEx(&controls);
     wchar_t data[1024];
     // This override also permits isolated acceptance runs without touching the user's library.
